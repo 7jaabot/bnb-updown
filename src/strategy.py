@@ -2,7 +2,7 @@
 strategy.py — Last-Second Momentum Strategy
 
 Logic:
-1. Monitor BTC price throughout the 5-minute window.
+1. Monitor BNB price throughout the 5-minute window.
 2. In the last `entry_window_seconds` of the window, compute P(Up).
 3. Compare P(Up) to Polymarket's YES price.
 4. If edge = |P(Up) - yes_price| > edge_threshold → signal a trade.
@@ -32,7 +32,7 @@ class Signal:
 
     side: str                  # "YES" or "NO"
     edge: float                # Our edge over Polymarket's price
-    p_up: float                # Our estimated P(BTC goes up)
+    p_up: float                # Our estimated P(BNB goes up)
     yes_price: float           # Polymarket's YES price at signal time
     kelly_fraction: float      # Raw Kelly fraction (before capping)
     position_size_usdc: float  # Recommended position size in USDC
@@ -76,7 +76,7 @@ def get_current_window(now: Optional[float] = None) -> WindowInfo:
     """
     Compute the current Polymarket 5-minute window.
 
-    Polymarket BTC 5mn windows are aligned to UTC 5-minute marks:
+    BNB Up/Down 5mn windows are aligned to UTC 5-minute marks:
     00:00, 00:05, 00:10, ...
 
     Returns:
@@ -139,7 +139,7 @@ def estimate_p_up_momentum(
     n_simulations: int = 500,
 ) -> float:
     """
-    Estimate P(BTC price at window end > BTC price at window start).
+    Estimate P(BNB price at window end > BNB price at window start).
 
     Method: Geometric Brownian Motion (GBM) Monte Carlo projection.
 
@@ -153,7 +153,7 @@ def estimate_p_up_momentum(
         n_simulations: Number of Monte Carlo paths.
 
     Returns:
-        Probability that BTC ends the window above its opening price.
+        Probability that BNB ends the window above its opening price.
         Returns 0.5 if insufficient data.
     """
     if len(prices) < 5:
@@ -169,13 +169,14 @@ def estimate_p_up_momentum(
     sigma = float(np.std(log_returns))     # Per-observation vol
 
     if sigma == 0:
-        # No volatility → deterministic: just check direction
+        # No volatility observed → not enough info for a strong signal
+        # Slight bias toward current direction, but never certainty
         if prices[-1] > prices[0]:
-            return 1.0
+            return 0.6
         elif prices[-1] < prices[0]:
-            return 0.0
+            return 0.4
         else:
-            return 0.5  # No movement → no information
+            return 0.5
 
     current_price = prices[-1]
     opening_price = prices[0]
@@ -192,11 +193,14 @@ def estimate_p_up_momentum(
     final_prices = current_price * np.exp(cumulative_log_returns)
 
     # P(Up) = fraction of paths where final price > opening price
-    p_up = float(np.mean(final_prices > opening_price))
+    p_up_raw = float(np.mean(final_prices > opening_price))
+
+    # Clamp to [0.20, 0.80] — force humility, avoid near-certain bets on 5mn crypto
+    p_up = max(0.20, min(0.80, p_up_raw))
 
     logger.debug(
         f"GBM estimate: μ={mu:.6f} σ={sigma:.6f} "
-        f"steps={steps} P(Up)={p_up:.3f}"
+        f"steps={steps} P(Up)={p_up:.3f} (raw={p_up_raw:.3f})"
     )
     return p_up
 
@@ -209,7 +213,7 @@ def compute_edge(p_up: float, yes_price: float) -> tuple[float, str]:
     Side = "YES" if we think it'll go up more than the market, "NO" otherwise.
 
     Args:
-        p_up: Our estimated probability that BTC goes up.
+        p_up: Our estimated probability that BNB goes up.
         yes_price: Polymarket's YES price (= market-implied P(Up)).
 
     Returns:
@@ -300,7 +304,7 @@ def compute_position_size(
 
 class Strategy:
     """
-    Last-Second Momentum Strategy for Polymarket BTC 5mn.
+    Last-Second Momentum Strategy for BNB Up/Down 5mn.
 
     Workflow:
     1. Called periodically by main loop with current price data + order book.
@@ -334,7 +338,7 @@ class Strategy:
         Evaluate whether to generate a trading signal.
 
         Args:
-            prices: BTC price series for the current window.
+            prices: BNB price series for the current window.
             yes_price: Polymarket's current YES price.
             window: Current window information.
             is_mock_data: Whether the order book data is mock.

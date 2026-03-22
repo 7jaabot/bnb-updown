@@ -1,7 +1,7 @@
 """
-market_data.py — Binance WebSocket BTC/USDT price feed
+market_data.py — Binance WebSocket BNB/USDT price feed
 
-Subscribes to wss://stream.binance.com:9443/ws/btcusdt@trade
+Subscribes to wss://stream.binance.com:9443/ws/bnbusdt@trade
 and maintains a rolling buffer of recent trade prices.
 """
 
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class PricePoint:
-    """Single BTC trade price with timestamp."""
+    """Single BNB trade price with timestamp."""
 
     def __init__(self, price: float, timestamp: float):
         self.price = price
@@ -30,13 +30,13 @@ class PricePoint:
 
 class BinanceFeed:
     """
-    Real-time BTC/USDT trade feed from Binance WebSocket.
+    Real-time BNB/USDT trade feed from Binance WebSocket.
 
     Maintains a rolling deque of PricePoint objects.
     Fires an optional on_price callback on each new trade.
     """
 
-    WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+    WS_URL = "wss://stream.binance.com:9443/ws/bnbusdt@trade"
 
     def __init__(
         self,
@@ -56,7 +56,7 @@ class BinanceFeed:
 
     @property
     def last_price(self) -> Optional[float]:
-        """Most recent BTC price, or None if no data yet."""
+        """Most recent BNB price, or None if no data yet."""
         return self._last_price
 
     def get_prices_since(self, seconds_ago: float) -> list[PricePoint]:

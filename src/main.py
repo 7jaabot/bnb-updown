@@ -1,5 +1,5 @@
 """
-main.py — Entry point for PRDT Finance BTC 5mn paper trading bot
+main.py — Entry point for BNB Up/Down PancakeSwap 5mn paper trading bot
 
 Architecture:
   - asyncio event loop runs the Binance WebSocket feed (async)
@@ -100,7 +100,7 @@ class PolymarketBot:
     Main bot orchestrator.
 
     Coordinates:
-    - BinanceFeed: real-time BTC price via WebSocket
+    - BinanceFeed: real-time BNB price via WebSocket
     - PolymarketClient: order book polling
     - Strategy: signal generation
     - PaperTrader: trade simulation and logging
@@ -123,13 +123,13 @@ class PolymarketBot:
 
         self._running = False
         self._last_window_index = -1
-        self._last_btc_window_open: float | None = None
+        self._last_bnb_window_open: float | None = None
         self._traded_this_window = False
         self._poll_interval = config.get("polymarket", {}).get("poll_interval_seconds", 5)
 
     def _on_price(self, pp: PricePoint):
         """Called on each new Binance trade price."""
-        self.logger.debug(f"BTC price: {pp.price:.2f}")
+        self.logger.debug(f"BNB price: {pp.price:.2f}")
 
     async def _run_main_loop(self):
         """Main async loop: poll Polymarket + evaluate strategy."""
@@ -155,11 +155,11 @@ class PolymarketBot:
         # Log status periodically
         if int(now) % 30 == 0:
             remaining = window.seconds_remaining
-            btc = self.binance.last_price
+            bnb = self.binance.last_price
             self.logger.info(
                 f"Window {window.window_index} | "
                 f"Remaining: {remaining:.0f}s | "
-                f"BTC: {f'{btc:.2f}' if btc is not None else 'N/A'} | "
+                f"BNB: {f'{bnb:.2f}' if bnb is not None else 'N/A'} | "
                 f"Bankroll: ${self.paper_trader.metrics.bankroll:.2f}"
             )
 
@@ -217,16 +217,16 @@ class PolymarketBot:
                 window.window_start_ts,
             )
             if prev_window_prices:
-                btc_open = prev_window_prices[0].price
-                btc_close = prev_window_prices[-1].price
+                bnb_open = prev_window_prices[0].price
+                bnb_close = prev_window_prices[-1].price
                 self.logger.info(
                     f"🔚 Window {self._last_window_index} ended: "
-                    f"BTC {btc_open:.2f} → {btc_close:.2f} "
-                    f"({'UP' if btc_close > btc_open else 'DOWN'} "
-                    f"{abs(btc_close/btc_open - 1):.3%})"
+                    f"BNB {bnb_open:.2f} → {bnb_close:.2f} "
+                    f"({'UP' if bnb_close > bnb_open else 'DOWN'} "
+                    f"{abs(bnb_close/bnb_open - 1):.3%})"
                 )
                 self.paper_trader.resolve_trades(
-                    self._last_window_index, btc_open, btc_close
+                    self._last_window_index, bnb_open, bnb_close
                 )
             else:
                 self.logger.warning(
@@ -236,12 +236,12 @@ class PolymarketBot:
         # Record new window open price
         self._last_window_index = window.window_index
         self._traded_this_window = False
-        btc = self.binance.last_price
-        self._last_btc_window_open = btc
+        bnb = self.binance.last_price
+        self._last_bnb_window_open = bnb
 
         self.logger.info(
             f"🆕 Window {window.window_index} started | "
-            f"BTC open: {f'{btc:.2f}' if btc is not None else 'N/A'}"
+            f"BNB open: {f'{bnb:.2f}' if bnb is not None else 'N/A'}"
         )
 
         # Update strategy bankroll
@@ -257,7 +257,7 @@ class PolymarketBot:
             loop.add_signal_handler(sig, self.stop)
 
         self.logger.info("="*60)
-        self.logger.info("  Polymarket BTC 5mn Paper Trading Bot")
+        self.logger.info("  BNB Up/Down 5mn Paper Trading Bot")
         self.logger.info("="*60)
 
         # Test PancakeSwap / BSC connectivity
@@ -294,7 +294,7 @@ class PolymarketBot:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Polymarket BTC 5mn Paper Trading Bot")
+    parser = argparse.ArgumentParser(description="BNB Up/Down 5mn Paper Trading Bot")
     parser.add_argument(
         "--config",
         default="config.json",

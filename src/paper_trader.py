@@ -38,8 +38,8 @@ class Trade:
     is_mock: bool                         # Based on mock data?
 
     # Resolution fields (filled later)
-    btc_open: Optional[float] = None      # BTC price at window start
-    btc_close: Optional[float] = None     # BTC price at window end
+    bnb_open: Optional[float] = None      # BNB price at window start
+    bnb_close: Optional[float] = None     # BNB price at window end
     outcome: Optional[str] = None         # "WIN" or "LOSS" or "PENDING"
     pnl_usdc: Optional[float] = None      # Profit/loss in USDC
     payout_per_share: Optional[float] = None
@@ -90,7 +90,7 @@ class PaperTrader:
     Paper trading engine.
 
     Accepts signals from the strategy and simulates trade execution.
-    Resolves trades after each window ends (comparing BTC open vs close).
+    Resolves trades after each window ends (comparing BNB open vs close).
     Persists all trades to a JSON log file.
     """
 
@@ -204,11 +204,12 @@ class PaperTrader:
 
         # Simulate latency impact on entry price (slight slippage)
         latency_slippage = (self.simulate_latency_ms / 1000.0) * 0.001  # tiny
-        entry_price = signal.yes_price
         if signal.side == "YES":
             entry_price = min(0.99, signal.yes_price + latency_slippage)
         else:
-            entry_price = max(0.01, signal.yes_price - latency_slippage)
+            # NO share price = 1 - YES price (+ slippage making it slightly worse)
+            no_price = 1.0 - signal.yes_price
+            entry_price = min(0.99, no_price + latency_slippage)
 
         trade = Trade(
             trade_id=trade_id,
@@ -249,19 +250,19 @@ class PaperTrader:
 
         return trade
 
-    def resolve_trades(self, window_index: int, btc_open: float, btc_close: float):
+    def resolve_trades(self, window_index: int, bnb_open: float, bnb_close: float):
         """
         Resolve all pending trades for a completed window.
 
         Args:
             window_index: The window that just completed.
-            btc_open: BTC price at window start.
-            btc_close: BTC price at window end.
+            bnb_open: BNB price at window start.
+            bnb_close: BNB price at window end.
         """
         resolved = []
         still_pending = []
 
-        btc_went_up = btc_close > btc_open
+        bnb_went_up = bnb_close > bnb_open
 
         for trade in self._pending_trades:
             if trade.window_index != window_index:
@@ -270,12 +271,12 @@ class PaperTrader:
 
             # Determine outcome
             if trade.side == "YES":
-                won = btc_went_up
+                won = bnb_went_up
             else:  # NO
-                won = not btc_went_up
+                won = not bnb_went_up
 
-            trade.btc_open = btc_open
-            trade.btc_close = btc_close
+            trade.bnb_open = bnb_open
+            trade.bnb_close = bnb_close
             trade.timestamp_exit = time.time()
 
             if won:
@@ -306,7 +307,7 @@ class PaperTrader:
             result_emoji = "✅" if won else "❌"
             logger.info(
                 f"{result_emoji} Trade resolved: {trade.trade_id} | "
-                f"{trade.side} | BTC {btc_open:.2f}→{btc_close:.2f} | "
+                f"{trade.side} | BNB {bnb_open:.2f}→{bnb_close:.2f} | "
                 f"PnL: ${trade.pnl_usdc:+.2f} | "
                 f"Bankroll: ${self.metrics.bankroll:.2f}"
             )

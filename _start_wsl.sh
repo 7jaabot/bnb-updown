@@ -1,7 +1,7 @@
 #!/bin/bash
 # PancakeSwap BNB/USD 5mn Paper Trader — WSL2 Launcher
 
-REPO="/home/joris/.openclaw/workspace/repos/prdt-btc"
+REPO="/home/joris/.openclaw/workspace/repos/bnb-updown"
 
 echo "========================================"
 echo "  PancakeSwap BNB/USD 5mn Paper Trader"
