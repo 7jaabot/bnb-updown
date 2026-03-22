@@ -1,11 +1,11 @@
 #!/bin/bash
-# Polymarket BTC 5mn Paper Trader — WSL2 Launcher
+# PancakeSwap BNB/USD 5mn Paper Trader — WSL2 Launcher
 
-REPO="/home/joris/.openclaw/workspace/repos/polymarket-btc"
+REPO="/home/joris/.openclaw/workspace/repos/prdt-btc"
 
 echo "========================================"
-echo "  Polymarket BTC 5mn Paper Trader"
-echo "  (WSL2 mode)"
+echo "  PancakeSwap BNB/USD 5mn Paper Trader"
+echo "  (BSC live data)"
 echo "========================================"
 echo ""
 
@@ -19,9 +19,9 @@ fi
 
 # Activate and install deps
 source venv/bin/activate
-pip install -r requirements.txt -q
+venv/bin/python3 -m pip install -r requirements.txt -q
 
 # Start the bot (always fresh — resets paper trading history)
-echo "Starting bot (fresh start)..."
+echo "Starting bot (fresh start, live BSC data)..."
 echo ""
 python src/main.py --fresh "$@"

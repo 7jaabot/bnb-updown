@@ -1,12 +1,12 @@
 @echo off
-REM Polymarket BTC 5mn Paper Trader — WSL2 Launcher
+REM PancakeSwap BNB/USD 5mn Paper Trader — WSL2 Launcher
 
 echo ========================================
-echo   Polymarket BTC 5mn Paper Trader
-echo   (WSL2 mode)
+echo   PancakeSwap BNB/USD 5mn Paper Trader
+echo   (BSC live data)
 echo ========================================
 echo.
 
-wsl bash /home/joris/.openclaw/workspace/repos/polymarket-btc/_start_wsl.sh %*
+wsl bash /home/joris/.openclaw/workspace/repos/prdt-btc/_start_wsl.sh %*
 
 pause
