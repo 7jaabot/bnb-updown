@@ -1,10 +1,10 @@
-# prdt-btc
+# bnb-updown
 
 BTC UP/DOWN 5-minute prediction bot for **PRDT Finance** (fork of polymarket-btc).
 
 ## Key differences vs polymarket-btc
 
-| | polymarket-btc | prdt-btc |
+| | polymarket-btc | bnb-updown |
 |---|---|---|
 | Market | Polymarket (REST API) | PRDT Finance (on-chain, Polygon) |
 | Price signal | YES price from order book | Bull/bear pool ratio via smart contract |
