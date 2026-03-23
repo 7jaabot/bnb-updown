@@ -326,6 +326,11 @@ class Strategy:
         self.bankroll = cfg.get("starting_bankroll_usdc", 1000.0)
         self.use_fair_odds = cfg.get("use_fair_odds", True)
 
+        pcfg = config.get("pancake", {})
+        self.min_yes_price = pcfg.get("min_yes_price", 0.15)
+        self.max_yes_price = pcfg.get("max_yes_price", 0.85)
+        self.min_pool_bnb = pcfg.get("min_pool_bnb", 5.0)
+
     def update_bankroll(self, new_bankroll: float):
         """Update the current bankroll after PnL changes."""
         self.bankroll = new_bankroll
@@ -336,6 +341,7 @@ class Strategy:
         yes_price: float,
         window: WindowInfo,
         is_mock_data: bool = False,
+        pool_total_bnb: float = 0.0,
     ) -> Optional[Signal]:
         """
         Evaluate whether to generate a trading signal.
@@ -345,6 +351,7 @@ class Strategy:
             yes_price: Polymarket's current YES price.
             window: Current window information.
             is_mock_data: Whether the order book data is mock.
+            pool_total_bnb: Total BNB in the pool (for size filter, only used when use_fair_odds=False).
 
         Returns:
             Signal if conditions met, None otherwise.
@@ -366,6 +373,20 @@ class Strategy:
             window_seconds=300.0,
             seconds_remaining=window.seconds_remaining,
         )
+
+        # Pool quality filters (only when trading against real pool prices)
+        if not self.use_fair_odds:
+            if yes_price < self.min_yes_price or yes_price > self.max_yes_price:
+                logger.info(
+                    f"Pool too skewed: yes_price={yes_price:.4f} "
+                    f"(allowed [{self.min_yes_price:.2f}, {self.max_yes_price:.2f}]) — skipping"
+                )
+                return None
+            if pool_total_bnb < self.min_pool_bnb:
+                logger.info(
+                    f"Pool too small: {pool_total_bnb:.3f} BNB (min={self.min_pool_bnb:.1f}) — skipping"
+                )
+                return None
 
         # Fair-odds mode: use 0.50 as the reference price regardless of pool
         # This avoids fictitious PnL from 99/1 pool imbalances

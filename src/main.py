@@ -205,6 +205,7 @@ class PolymarketBot:
             yes_price=yes_price_equiv,
             window=window,
             is_mock_data=round_data.is_mock,
+            pool_total_bnb=round_data.total_bnb,
         )
 
         if signal and not self._traded_this_window:

@@ -17,7 +17,10 @@
     "use_mock_on_failure": true,
     "fee": 0.03,
     "chain": "bsc",
-    "asset": "BNB/USD"
+    "asset": "BNB/USD",
+    "min_yes_price": 0.15,
+    "max_yes_price": 0.85,
+    "min_pool_bnb": 5.0
   },
   "binance": {
     "ws_url": "wss://stream.binance.com:9443/ws/bnbusdt@trade",
