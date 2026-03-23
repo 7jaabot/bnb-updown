@@ -2,7 +2,7 @@
   "strategy": {
     "edge_threshold": 0.15,
     "kelly_fraction": 0.25,
-    "max_position_usdc": 50.0,
+    "max_position_usdc": 15.0,
     "starting_bankroll_usdc": 1000.0,
     "entry_window_seconds": 60,
     "momentum_window_seconds": 300,
@@ -20,7 +20,7 @@
     "asset": "BNB/USD",
     "min_yes_price": 0.15,
     "max_yes_price": 0.85,
-    "min_pool_bnb": 5.0
+    "min_pool_bnb": 1.0
   },
   "binance": {
     "ws_url": "wss://stream.binance.com:9443/ws/bnbusdt@trade",
