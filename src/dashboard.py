@@ -167,13 +167,23 @@ class Dashboard:
 
         # ── Line 6: empty ──
 
-        # ── Line 7: Window / Time Left / Status ──
+        # ── Line 7: Epoch / Lock in / Phase / Status ──
         if self._current_window is not None:
             w = self._current_window
-            time_left = int(w.seconds_remaining)
+            lock_in = int(w.seconds_remaining)
+
+            # Determine phase label
+            entry_secs = getattr(w, 'entry_window_seconds', 60.0)
+            if lock_in <= 0:
+                phase = "[bold red]LOCKED[/bold red]"
+            elif lock_in <= entry_secs:
+                phase = "[bold yellow]EVALUATING[/bold yellow]"
+            else:
+                phase = "[bold green]BET OPEN[/bold green]"
+
             window_line = (
-                f"Window: #{w.window_index}  |  Time Left: {time_left}s  |  "
-                f"Status: {self._status}"
+                f"Epoch: #{w.window_index}  |  Lock in: {lock_in}s  |  "
+                f"Phase: {phase}  |  Status: {self._status}"
             )
         else:
             window_line = f"Status: {self._status}"

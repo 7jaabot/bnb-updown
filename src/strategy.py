@@ -49,32 +49,62 @@ class Signal:
 
 @dataclass
 class WindowInfo:
-    """Information about the current 5-minute Polymarket window."""
+    """Information about the current PancakeSwap epoch / betting window."""
 
-    window_start_ts: float     # Unix timestamp of window start
-    window_end_ts: float       # Unix timestamp of window end
-    seconds_remaining: float   # Seconds until window closes
-    window_index: int          # Which 5-minute window this is
+    window_start_ts: float     # Unix timestamp of round start (start_ts from contract)
+    window_end_ts: float       # Unix timestamp of lock (lock_ts from contract — betting deadline)
+    seconds_remaining: float   # Seconds until lock_ts (betting closes)
+    window_index: int          # Epoch number (from contract)
+    entry_window_seconds: float = 60.0  # How many seconds before lock is "entry window"
 
     @property
     def is_entry_window(self) -> bool:
-        """True if we're in the last minute of the window (entry zone)."""
-        return self.seconds_remaining <= 60.0
+        """True if we're in the last N seconds before lock (entry zone)."""
+        return self.seconds_remaining <= self.entry_window_seconds
 
     @property
     def progress_pct(self) -> float:
-        """How far through the 5-minute window we are (0.0 → 1.0)."""
+        """How far through the betting window we are (0.0 → 1.0)."""
+        duration = self.window_end_ts - self.window_start_ts
+        if duration <= 0:
+            return 1.0
         elapsed = time.time() - self.window_start_ts
-        return min(1.0, elapsed / 300.0)
+        return min(1.0, elapsed / duration)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pure calculation functions (unit-testable)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def window_from_round(round_data, entry_window_seconds: float = 60.0) -> WindowInfo:
+    """
+    Build a WindowInfo from PancakeSwap contract round data.
+
+    Args:
+        round_data: PancakeRound instance (from pancake.py).
+        entry_window_seconds: How many seconds before lock_ts counts as entry window.
+
+    Returns:
+        WindowInfo populated from the round's start_ts, lock_ts, and epoch.
+    """
+    now = time.time()
+    seconds_remaining = max(0.0, round_data.lock_ts - now)
+
+    return WindowInfo(
+        window_start_ts=float(round_data.start_ts),
+        window_end_ts=float(round_data.lock_ts),
+        seconds_remaining=seconds_remaining,
+        window_index=round_data.epoch,
+        entry_window_seconds=entry_window_seconds,
+    )
+
+
 def get_current_window(now: Optional[float] = None) -> WindowInfo:
     """
-    Compute the current Polymarket 5-minute window.
+    Compute a clock-aligned 5-minute window (fallback / legacy use only).
+
+    Prefer window_from_round() when PancakeSwap round data is available,
+    as it uses the contract's actual start_ts and lock_ts.
 
     BNB Up/Down 5mn windows are aligned to UTC 5-minute marks:
     00:00, 00:05, 00:10, ...

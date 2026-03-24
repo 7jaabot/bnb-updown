@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from market_data import BinanceFeed, PricePoint
 from pancake import PancakeClient, PancakeRound
-from strategy import Strategy, get_current_window
+from strategy import Strategy, WindowInfo, window_from_round
 from paper_trader import PaperTrader
 
 
@@ -252,9 +252,12 @@ class PolymarketBot:
         self.dashboard = Dashboard(trader=trader, binance=self.binance, mode=mode)
 
         self._running = False
-        self._last_window_index = -1
+        self._last_epoch: int = -1
         self._last_bnb_window_open: float | None = None
-        self._traded_this_window = False
+        self._traded_this_epoch = False
+        self._last_round_data: PancakeRound | None = None  # cached round data
+        self._last_poll_ts: float = 0.0  # when we last polled the contract
+        self._in_entry_window: bool = False  # whether we're currently in entry window
         self._poll_interval = config.get("polymarket", {}).get("poll_interval_seconds", 5)
         self._live_ref = None  # Rich Live instance (set during run())
 
@@ -296,56 +299,88 @@ class PolymarketBot:
             await asyncio.sleep(30)
 
     async def _tick(self):
-        """One iteration of the main loop."""
-        now = time.time()
-        window = get_current_window(now)
+        """
+        One iteration of the main loop.
 
-        # Update window info in dashboard
+        Polling strategy to minimize RPC calls:
+        - When outside the entry window: poll every ~30s to detect epoch change.
+        - When inside the entry window (<60s before lock): poll every tick (5s).
+        """
+        now = time.time()
+        loop = asyncio.get_event_loop()
+
+        # Determine if we should poll the contract this tick.
+        # In entry window → always poll. Outside → every 30s.
+        poll_interval_outside = 30.0
+        should_poll = (
+            self._in_entry_window
+            or self._last_round_data is None
+            or (now - self._last_poll_ts) >= poll_interval_outside
+        )
+
+        round_data = self._last_round_data
+
+        if should_poll:
+            fetched = await loop.run_in_executor(None, self.pancake.get_current_round)
+            if fetched is not None:
+                round_data = fetched
+                self._last_round_data = round_data
+                self._last_poll_ts = now
+            elif round_data is None:
+                self.logger.warning("Could not get PancakeSwap round — skipping this tick.")
+                self.dashboard.update_status("⚠️ PancakeSwap unavailable")
+                self._refresh_display()
+                return
+
+        # Detect epoch change
+        current_epoch = round_data.epoch
+        if current_epoch != self._last_epoch:
+            self._on_new_epoch(current_epoch, round_data)
+
+        # Calculate time until lock_ts (end of bet phase)
+        seconds_to_lock = round_data.lock_ts - now
+        self._in_entry_window = 0 < seconds_to_lock <= self.strategy.entry_window_seconds
+
+        # Build WindowInfo from contract round data
+        window = window_from_round(round_data, entry_window_seconds=self.strategy.entry_window_seconds)
+
+        # Update dashboard window info
         self.dashboard.update_window(window)
 
-        # Detect new window
-        if window.window_index != self._last_window_index:
-            self._on_new_window(window)
-
-        # Periodic status log (every 30s) — goes to file only (dashboard shows live)
+        # Periodic status log (every 30s) — file only, dashboard shows live
         if int(now) % 30 == 0:
-            remaining = window.seconds_remaining
             bnb = self.binance.last_price
             if hasattr(self.trader, 'metrics'):
                 bankroll_str = f"${self.trader.metrics.bankroll:.2f}" if hasattr(self.trader.metrics, 'bankroll') else "N/A"
             else:
                 bankroll_str = "N/A"
+            phase = "BET OPEN" if seconds_to_lock > self.strategy.entry_window_seconds else (
+                "EVALUATING" if seconds_to_lock > 0 else "LOCKED"
+            )
             self.logger.info(
-                f"Window {window.window_index} | "
-                f"Remaining: {remaining:.0f}s | "
+                f"Epoch #{current_epoch} | Phase: {phase} | "
+                f"Lock in: {seconds_to_lock:.0f}s | "
                 f"BNB: {f'{bnb:.2f}' if bnb is not None else 'N/A'} | "
                 f"Balance: {bankroll_str}"
             )
 
-        # Only evaluate in the entry window
-        if window.seconds_remaining > self.strategy.entry_window_seconds:
-            self.dashboard.update_status("⏳ Waiting for entry window")
+        # Only evaluate in the entry window (last N seconds before lock)
+        if not self._in_entry_window:
+            if seconds_to_lock <= 0:
+                self.dashboard.update_status("🔒 Round locked")
+            else:
+                self.dashboard.update_status("⏳ Waiting for entry window")
             self._refresh_display()
             return
 
         self.dashboard.update_status("🔍 Evaluating signal")
 
-        # Get current price series for this window
-        window_prices_raw = self.binance.get_window_prices(window.window_start_ts)
+        # Get price series from round's start_ts (not clock-aligned window)
+        window_prices_raw = self.binance.get_window_prices(round_data.start_ts)
         prices = [pp.price for pp in window_prices_raw]
 
         if not prices:
-            self.logger.debug("No prices in window yet.")
-            self._refresh_display()
-            return
-
-        # Fetch current PancakeSwap BNB/USD round from BSC
-        loop = asyncio.get_event_loop()
-        round_data = await loop.run_in_executor(None, self.pancake.get_current_round)
-
-        if round_data is None:
-            self.logger.warning("Could not get PancakeSwap round — skipping this tick.")
-            self.dashboard.update_status("⚠️ PancakeSwap unavailable")
+            self.logger.debug("No prices in epoch window yet.")
             self._refresh_display()
             return
 
@@ -360,14 +395,14 @@ class PolymarketBot:
             f"Pool: bull={round_data.bull_ratio:.1%} bear={round_data.bear_ratio:.1%} "
             f"({round_data.total_bnb:.3f} BNB) | "
             f"Pool YES≡: {yes_price_equiv:.3f}{pool_tag} | "
-            f"Remaining: {window.seconds_remaining:.0f}s"
+            f"Lock in: {seconds_to_lock:.0f}s"
             + (" [MOCK]" if round_data.is_mock else "")
         )
 
         # Log evaluation to dashboard
-        bnb_price_now = prices[-1] if prices else None
         self.dashboard.log(
-            f"Evaluating: P(Up)=? | Pool: {round_data.total_bnb:.1f} BNB "
+            f"Epoch #{current_epoch} | Lock in {seconds_to_lock:.0f}s | "
+            f"Pool: {round_data.total_bnb:.1f} BNB "
             f"(bull {round_data.bull_ratio:.0%} / bear {round_data.bear_ratio:.0%})"
             + (" [MOCK]" if round_data.is_mock else "")
         )
@@ -383,7 +418,7 @@ class PolymarketBot:
         )
 
         if signal:
-            if not self._traded_this_window:
+            if not self._traded_this_epoch:
                 # Log signal to dashboard
                 self.dashboard.log(
                     f"🎯 Signal: {signal.side} @ edge={signal.edge:.2f} | ${signal.position_size_usdc:.2f}"
@@ -391,69 +426,113 @@ class PolymarketBot:
                 self.dashboard.update_status(f"🎯 Entering {signal.side} trade...")
                 self._refresh_display()
 
-                # Enter trade (one trade per window max)
+                # Enter trade (one trade per epoch max)
                 self.trader.enter_trade(signal, window)
-                self._traded_this_window = True
+                self._traded_this_epoch = True
 
                 self.dashboard.update_status(f"✅ Trade entered: {signal.side}")
                 self.dashboard.log(
-                    f"✅ Trade entered: bet{signal.side.capitalize()} epoch #{window.window_index}"
+                    f"✅ Trade entered: bet{signal.side.capitalize()} epoch #{current_epoch}"
                 )
             else:
-                self.dashboard.update_status("⏸ Already traded this window")
+                self.dashboard.update_status("⏸ Already traded this epoch")
         else:
-            # No signal — show last evaluation status
             self.dashboard.update_status("🔍 Evaluating signal")
 
         self._refresh_display()
 
-    def _on_new_window(self, window):
-        """Called when a new 5-minute window starts."""
-        # Resolve previous window's trades
-        if self._last_window_index > 0:
-            prev_window_prices = self.binance.get_window_prices(
-                window.window_start_ts - 300,
-                window.window_start_ts,
-            )
-            if prev_window_prices:
-                bnb_open = prev_window_prices[0].price
-                bnb_close = prev_window_prices[-1].price
-                direction = "UP" if bnb_close > bnb_open else "DOWN"
-                pct_change = abs(bnb_close / bnb_open - 1)
-                self.logger.info(
-                    f"🔚 Window {self._last_window_index} ended: "
-                    f"BNB {bnb_open:.2f} → {bnb_close:.2f} "
-                    f"({'UP' if bnb_close > bnb_open else 'DOWN'} "
-                    f"{pct_change:.3%})"
+    def _on_new_epoch(self, new_epoch: int, round_data: PancakeRound):
+        """
+        Called when currentEpoch() advances to a new value.
+
+        Epoch lifecycle when we detect epoch N as current:
+          - Epoch N    → currently in BET phase (lock_ts in the future)
+          - Epoch N-1  → just locked (no more bets), waiting for oracle close
+          - Epoch N-2  → just CLOSED (oracle called) → resolve trades for this epoch
+
+        We resolve epoch N-2 using prices from its start_ts to close_ts.
+        """
+        if self._last_epoch > 0:
+            # Epoch that just closed = last_epoch - 1
+            resolve_epoch = self._last_epoch - 1
+
+            # Fetch round data for the closed epoch to get its time range
+            loop = None
+            try:
+                closed_round = self.pancake.get_round_by_epoch(resolve_epoch)
+            except Exception as e:
+                self.logger.warning(f"Could not fetch data for closed epoch {resolve_epoch}: {e}")
+                closed_round = None
+
+            if closed_round is not None:
+                # Use prices from that epoch's start_ts to close_ts
+                epoch_prices = self.binance.get_window_prices(
+                    closed_round.start_ts,
+                    closed_round.close_ts,
                 )
-                self.dashboard.log(
-                    f"🔚 Window #{self._last_window_index} resolved: "
-                    f"BNB {direction} {pct_change:.2%}"
-                )
-                self.trader.resolve_trades(
-                    self._last_window_index, bnb_open, bnb_close
-                )
+                if epoch_prices:
+                    bnb_open = epoch_prices[0].price
+                    bnb_close = epoch_prices[-1].price
+                    direction = "UP" if bnb_close > bnb_open else "DOWN"
+                    pct_change = abs(bnb_close / bnb_open - 1)
+                    self.logger.info(
+                        f"🔚 Epoch #{resolve_epoch} closed: "
+                        f"BNB {bnb_open:.2f} → {bnb_close:.2f} "
+                        f"({direction} {pct_change:.3%})"
+                    )
+                    self.dashboard.log(
+                        f"🔚 Epoch #{resolve_epoch} resolved: BNB {direction} {pct_change:.2%}"
+                    )
+                    self.trader.resolve_trades(resolve_epoch, bnb_open, bnb_close)
+                else:
+                    # Fallback: use prices from a window ending at close_ts
+                    fallback_start = closed_round.start_ts
+                    fallback_prices = self.binance.get_window_prices(fallback_start)
+                    if fallback_prices:
+                        bnb_open = fallback_prices[0].price
+                        bnb_close = fallback_prices[-1].price
+                        direction = "UP" if bnb_close > bnb_open else "DOWN"
+                        pct_change = abs(bnb_close / bnb_open - 1)
+                        self.logger.info(
+                            f"🔚 Epoch #{resolve_epoch} closed (fallback prices): "
+                            f"BNB {bnb_open:.2f} → {bnb_close:.2f} "
+                            f"({direction} {pct_change:.3%})"
+                        )
+                        self.dashboard.log(
+                            f"🔚 Epoch #{resolve_epoch} resolved (approx): BNB {direction} {pct_change:.2%}"
+                        )
+                        self.trader.resolve_trades(resolve_epoch, bnb_open, bnb_close)
+                    else:
+                        self.logger.warning(
+                            f"No price data for epoch #{resolve_epoch} — cannot resolve trades."
+                        )
+                        self.dashboard.log(
+                            f"⚠️ Epoch #{resolve_epoch}: no price data — cannot resolve"
+                        )
             else:
                 self.logger.warning(
-                    f"No prices for window {self._last_window_index} — cannot resolve trades."
+                    f"Could not fetch closed round data for epoch #{resolve_epoch} — skipping resolution."
                 )
                 self.dashboard.log(
-                    f"⚠️ Window #{self._last_window_index}: no price data — cannot resolve"
+                    f"⚠️ Epoch #{resolve_epoch}: round data unavailable — cannot resolve"
                 )
 
-        # Record new window open price
-        self._last_window_index = window.window_index
-        self._traded_this_window = False
+        # Advance to new epoch
+        self._last_epoch = new_epoch
+        self._traded_this_epoch = False
+        self._in_entry_window = False
+
         bnb = self.binance.last_price
         self._last_bnb_window_open = bnb
-
         bnb_str = f"${bnb:.2f}" if bnb is not None else "N/A"
+
         self.logger.info(
-            f"🆕 Window {window.window_index} started | "
-            f"BNB open: {bnb_str}"
+            f"🆕 Epoch #{new_epoch} started | BNB: {bnb_str} | "
+            f"Lock at: {round_data.lock_ts:.0f} (in {round_data.lock_ts - time.time():.0f}s)"
         )
         self.dashboard.log(
-            f"Window #{window.window_index} started | BNB: {bnb_str}"
+            f"Epoch #{new_epoch} started | BNB: {bnb_str} | "
+            f"Lock in {round_data.lock_ts - time.time():.0f}s"
         )
         self.dashboard.update_status("⏳ Waiting for entry window")
 

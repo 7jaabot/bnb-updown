@@ -203,6 +203,7 @@ class PancakeClient:
         return False
 
     def get_current_round(self) -> Optional[PancakeRound]:
+        """Fetch the round currently in bet phase (currentEpoch)."""
         if self._connected and self._w3:
             try:
                 return self._fetch_round_onchain()
@@ -213,13 +214,33 @@ class PancakeClient:
             return _mock_round()
         return None
 
+    def get_round_by_epoch(self, epoch: int) -> Optional[PancakeRound]:
+        """Fetch round data for a specific epoch number."""
+        if self._connected and self._w3:
+            try:
+                return self._fetch_round_for_epoch(epoch)
+            except Exception as e:
+                logger.warning(f"PancakeSwap on-chain read for epoch {epoch} failed: {e}")
+
+        if self.use_mock_on_failure:
+            return _mock_round()
+        return None
+
     def _fetch_round_onchain(self) -> PancakeRound:
+        """Fetch currentEpoch() then its round data."""
         import eth_abi
         addr = self._w3.to_checksum_address(self.contract_address)
 
         # currentEpoch()
         raw_epoch = self._w3.eth.call({"to": addr, "data": self._sel_epoch})
         epoch = int.from_bytes(raw_epoch, "big")
+
+        return self._fetch_round_for_epoch(epoch)
+
+    def _fetch_round_for_epoch(self, epoch: int) -> PancakeRound:
+        """Fetch rounds(epoch) raw bytes and decode."""
+        import eth_abi
+        addr = self._w3.to_checksum_address(self.contract_address)
 
         # rounds(epoch) — raw bytes, decoded manually
         data = self._sel_rounds + eth_abi.encode(["uint256"], [epoch])
