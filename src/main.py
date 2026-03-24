@@ -400,7 +400,7 @@ class PolymarketBot:
         )
 
         # Compute P(Up) for dashboard display (before strategy filters)
-        from strategy import estimate_p_up_momentum, window_from_round
+        from strategy import estimate_p_up_momentum
         p_up_display = estimate_p_up_momentum(
             prices=prices,
             window_seconds=300.0,
