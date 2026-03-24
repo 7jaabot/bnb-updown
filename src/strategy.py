@@ -427,6 +427,15 @@ class Strategy:
             return None
 
         if not self.use_fair_odds and prices:
+            # Check opposite side has liquidity (no opponent = no profit even if we win)
+            opposite_bnb = pool_bear_bnb if side == "YES" else pool_bull_bnb
+            if opposite_bnb < 0.01:
+                logger.info(
+                    f"Opposite side empty: {'BEAR' if side == 'YES' else 'BULL'} = "
+                    f"{opposite_bnb:.4f} BNB — no profit possible, skipping"
+                )
+                return None
+
             bet_bnb = pos_size / prices[-1]  # approximate BNB equivalent
             side_bnb = pool_bull_bnb if side == "YES" else pool_bear_bnb
             if side_bnb > 0 and bet_bnb / side_bnb > self.max_bet_share_of_side:
