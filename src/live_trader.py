@@ -1,0 +1,767 @@
+"""
+live_trader.py — Live trading engine for BNB Up/Down PancakeSwap Prediction bot
+
+Mirrors the PaperTrader interface but executes real on-chain transactions on BSC.
+Private key is loaded ONLY from the BSC_PRIVATE_KEY environment variable.
+
+SAFEGUARDS:
+  - Balance check before every trade
+  - Max daily loss limit (configurable, default $100)
+  - Gas price estimation with configurable buffer
+  - Transaction retry logic (1 retry max)
+  - All transactions logged with tx hash to data/live_trades.json
+
+PancakeSwap Prediction V2 (BNB/USD, BSC):
+  Contract: 0x18B2A687610328590Bc8F2e5fEdDe3b582A49cdA
+  betBull(uint256 epoch) — payable, BNB value = bet amount
+  betBear(uint256 epoch) — payable, BNB value = bet amount
+  claim(uint256[] calldata epochs) — claim winnings
+  claimable(uint256 epoch, address user) — check claimability
+  currentEpoch() — get current epoch number
+"""
+
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass, asdict
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+PANCAKE_CONTRACT = "0x18B2A687610328590Bc8F2e5fEdDe3b582A49cdA"
+PANCAKE_FEE = 0.03
+
+BSC_RPC_URLS = [
+    "https://bsc-dataseed.binance.org/",
+    "https://bsc-dataseed1.defibit.io/",
+    "https://bsc-dataseed2.defibit.io/",
+    "https://1rpc.io/bnb",
+]
+
+# Minimal ABI — only the functions we call
+PANCAKE_ABI = [
+    {
+        "name": "betBull",
+        "type": "function",
+        "inputs": [{"name": "epoch", "type": "uint256"}],
+        "outputs": [],
+        "stateMutability": "payable",
+    },
+    {
+        "name": "betBear",
+        "type": "function",
+        "inputs": [{"name": "epoch", "type": "uint256"}],
+        "outputs": [],
+        "stateMutability": "payable",
+    },
+    {
+        "name": "claim",
+        "type": "function",
+        "inputs": [{"name": "epochs", "type": "uint256[]"}],
+        "outputs": [],
+        "stateMutability": "nonpayable",
+    },
+    {
+        "name": "claimable",
+        "type": "function",
+        "inputs": [
+            {"name": "epoch", "type": "uint256"},
+            {"name": "user", "type": "address"},
+        ],
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "view",
+    },
+    {
+        "name": "refundable",
+        "type": "function",
+        "inputs": [
+            {"name": "epoch", "type": "uint256"},
+            {"name": "user", "type": "address"},
+        ],
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "view",
+    },
+    {
+        "name": "currentEpoch",
+        "type": "function",
+        "inputs": [],
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+    },
+]
+
+
+@dataclass
+class LiveTrade:
+    """A live on-chain trade record."""
+
+    trade_id: str
+    timestamp_entry: float
+    timestamp_exit: Optional[float]
+    side: str                              # "YES" (bull) or "NO" (bear)
+    entry_price: float                     # yes_price at entry
+    position_size_usdc: float             # USDC equivalent wagered
+    bet_bnb: float                        # Actual BNB sent on-chain
+    bnb_price_at_entry: float             # BNB/USDC at entry time
+    p_up_at_entry: float
+    yes_price_at_entry: float
+    edge_at_entry: float
+    kelly_fraction: float
+    window_start_ts: float
+    window_end_ts: float
+    window_index: int
+    epoch: int                            # PancakeSwap epoch
+    is_mock: bool
+    tx_hash: Optional[str] = None        # Transaction hash (never None after submit)
+    tx_status: Optional[str] = None      # "pending", "success", "failed", "retried"
+
+    # Resolution fields
+    bnb_open: Optional[float] = None
+    bnb_close: Optional[float] = None
+    outcome: Optional[str] = None
+    pnl_usdc: Optional[float] = None
+    payout_per_share: Optional[float] = None
+    claim_tx_hash: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class LiveMetrics:
+    """Running metrics for live trading."""
+
+    total_trades: int = 0
+    wins: int = 0
+    losses: int = 0
+    pending: int = 0
+    total_pnl: float = 0.0
+    total_wagered: float = 0.0
+    avg_edge: float = 0.0
+    bankroll: float = 0.0          # Current BNB balance in USDC equiv
+    daily_pnl: float = 0.0         # PnL since midnight UTC
+    daily_loss_start: float = 0.0  # Bankroll at start of day
+
+    @property
+    def win_rate(self) -> float:
+        resolved = self.wins + self.losses
+        if resolved == 0:
+            return 0.0
+        return self.wins / resolved
+
+    @property
+    def roi(self) -> float:
+        if self.total_wagered == 0:
+            return 0.0
+        return self.total_pnl / self.total_wagered
+
+    def summary(self) -> str:
+        return (
+            f"Trades: {self.total_trades} | "
+            f"Win rate: {self.win_rate:.1%} ({self.wins}W/{self.losses}L/{self.pending}P) | "
+            f"PnL: ${self.total_pnl:+.2f} | "
+            f"ROI: {self.roi:.2%} | "
+            f"Daily PnL: ${self.daily_pnl:+.2f} | "
+            f"Avg edge: {self.avg_edge:.3f}"
+        )
+
+
+class LiveTrader:
+    """
+    Live trading engine — real on-chain transactions on PancakeSwap Prediction V2 (BSC).
+
+    Shares the same interface as PaperTrader:
+      enter_trade(signal, window)
+      resolve_trades(window_index, bnb_open, bnb_close)
+      print_summary()
+    """
+
+    def __init__(self, config: dict):
+        cfg_live = config.get("live_trading", {})
+        cfg_strategy = config.get("strategy", {})
+        cfg_pancake = config.get("pancake", {})
+
+        self.log_file = cfg_live.get("log_file", "data/live_trades.json")
+        self.max_daily_loss_usdc = cfg_live.get("max_daily_loss_usdc", 100.0)
+        self.gas_price_buffer_pct = cfg_live.get("gas_price_buffer_pct", 0.10)
+        self.auto_claim = cfg_live.get("auto_claim", True)
+
+        self.contract_address = cfg_pancake.get("contract_address", PANCAKE_CONTRACT)
+        self.rpc_url = cfg_pancake.get("rpc_url", None)
+        self.timeout = cfg_pancake.get("timeout_seconds", 8)
+
+        self._w3 = None
+        self._account = None
+        self._contract = None
+        self._wallet_address = None
+
+        self.metrics = LiveMetrics()
+        self._trades: list[LiveTrade] = []
+        self._pending_trades: list[LiveTrade] = []
+        self._trade_counter = 0
+
+        # Load .env and init
+        self._load_env()
+        self._init_web3()
+        self._load_trades()
+        self._reset_daily_tracking()
+
+    # ─── Environment & Web3 Setup ────────────────────────────────────────────
+
+    def _load_env(self):
+        """Load environment variables from .env file (via python-dotenv)."""
+        try:
+            from dotenv import load_dotenv
+            import pathlib
+            # Try repo root
+            env_path = pathlib.Path(__file__).parent.parent / ".env"
+            if env_path.exists():
+                load_dotenv(env_path)
+                logger.debug(f"Loaded .env from {env_path}")
+            else:
+                load_dotenv()
+        except ImportError:
+            logger.warning("python-dotenv not installed — relying on environment variables only")
+
+    def _init_web3(self):
+        """Connect to BSC and load wallet. Raises on failure."""
+        try:
+            from web3 import Web3
+            from web3.middleware import ExtraDataToPOAMiddleware
+        except ImportError:
+            raise RuntimeError("web3.py is required for live trading: pip install web3")
+
+        private_key = os.environ.get("BSC_PRIVATE_KEY", "").strip()
+        wallet_addr = os.environ.get("BSC_WALLET_ADDRESS", "").strip()
+
+        if not private_key:
+            raise RuntimeError(
+                "BSC_PRIVATE_KEY not set. "
+                "Set it in .env or as an environment variable. "
+                "Example: BSC_PRIVATE_KEY=0xYOUR_KEY_HERE"
+            )
+        if not wallet_addr:
+            raise RuntimeError("BSC_WALLET_ADDRESS not set in .env or environment.")
+
+        # Connect to BSC
+        urls = [self.rpc_url] if self.rpc_url else BSC_RPC_URLS
+        w3 = None
+        for url in urls:
+            try:
+                candidate = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": self.timeout}))
+                candidate.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+                _ = candidate.eth.block_number
+                w3 = candidate
+                logger.info(f"✅ Live trader: connected to BSC via {url}")
+                break
+            except Exception as e:
+                logger.debug(f"RPC {url} failed: {e}")
+
+        if w3 is None:
+            raise RuntimeError("Cannot connect to BSC — no RPC reachable. Check network.")
+
+        self._w3 = w3
+        self._wallet_address = w3.to_checksum_address(wallet_addr)
+
+        # Load account from private key (NEVER log the key)
+        self._account = w3.eth.account.from_key(private_key)
+        if self._account.address.lower() != self._wallet_address.lower():
+            raise RuntimeError(
+                f"Private key address ({self._account.address}) does not match "
+                f"BSC_WALLET_ADDRESS ({self._wallet_address}). Check your .env."
+            )
+
+        # Load contract
+        checksum_addr = w3.to_checksum_address(self.contract_address)
+        self._contract = w3.eth.contract(address=checksum_addr, abi=PANCAKE_ABI)
+
+        # Validate balance
+        balance_wei = w3.eth.get_balance(self._wallet_address)
+        balance_bnb = balance_wei / 1e18
+        logger.info(f"💰 Wallet: {self._wallet_address}")
+        logger.info(f"💰 BNB balance: {balance_bnb:.6f} BNB")
+
+        if balance_bnb < 0.001:
+            logger.warning(
+                f"⚠️  Very low BNB balance ({balance_bnb:.6f} BNB). "
+                "You may not be able to cover gas + bets."
+            )
+
+    def _reset_daily_tracking(self):
+        """Reset daily P&L tracking at start of UTC day."""
+        import datetime
+        now = datetime.datetime.utcnow()
+        midnight = datetime.datetime(now.year, now.month, now.day)
+        self._day_start_ts = midnight.timestamp()
+        # Compute daily PnL from today's trades
+        today_trades = [
+            t for t in self._trades
+            if t.timestamp_entry >= self._day_start_ts and t.pnl_usdc is not None
+        ]
+        self.metrics.daily_pnl = sum(t.pnl_usdc for t in today_trades)
+
+    # ─── Balance & Safeguards ────────────────────────────────────────────────
+
+    def get_bnb_balance(self) -> float:
+        """Return current wallet BNB balance."""
+        balance_wei = self._w3.eth.get_balance(self._wallet_address)
+        return balance_wei / 1e18
+
+    def _check_safeguards(self, position_size_usdc: float, bnb_price: float) -> bool:
+        """
+        Run all safeguard checks before placing a trade.
+
+        Returns True if safe to trade, False otherwise.
+        """
+        # Daily loss limit
+        if self.metrics.daily_pnl <= -self.max_daily_loss_usdc:
+            logger.warning(
+                f"🛑 Daily loss limit reached: ${self.metrics.daily_pnl:.2f} "
+                f"(limit: -${self.max_daily_loss_usdc:.2f}). Skipping trade."
+            )
+            return False
+
+        # Check if this trade would breach the limit
+        projected_daily = self.metrics.daily_pnl - position_size_usdc
+        if projected_daily <= -self.max_daily_loss_usdc:
+            logger.warning(
+                f"🛑 Trade would breach daily loss limit. "
+                f"Daily PnL: ${self.metrics.daily_pnl:.2f}, "
+                f"trade size: ${position_size_usdc:.2f}. Skipping."
+            )
+            return False
+
+        # BNB balance check
+        bet_bnb = position_size_usdc / bnb_price
+        gas_reserve_bnb = 0.005  # ~0.005 BNB for gas
+        required_bnb = bet_bnb + gas_reserve_bnb
+        current_bnb = self.get_bnb_balance()
+
+        if current_bnb < required_bnb:
+            logger.warning(
+                f"🛑 Insufficient BNB: have {current_bnb:.6f}, "
+                f"need {required_bnb:.6f} (bet={bet_bnb:.6f} + gas={gas_reserve_bnb:.6f})"
+            )
+            return False
+
+        return True
+
+    # ─── Transaction Execution ───────────────────────────────────────────────
+
+    def _estimate_gas_price(self) -> int:
+        """Estimate gas price with buffer."""
+        gas_price = self._w3.eth.gas_price
+        buffer = int(gas_price * self.gas_price_buffer_pct)
+        return gas_price + buffer
+
+    def _send_transaction(self, tx: dict, description: str) -> Optional[str]:
+        """
+        Sign and send a transaction. Retries once on failure.
+
+        Returns:
+            Transaction hash hex string, or None on failure.
+        """
+        for attempt in range(2):  # 1 retry max
+            try:
+                signed = self._account.sign_transaction(tx)
+                tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
+                tx_hash_hex = tx_hash.hex()
+                logger.info(f"📤 {description} sent — tx: {tx_hash_hex}")
+
+                # Wait for receipt (timeout 60s)
+                receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+                if receipt.status == 1:
+                    logger.info(f"✅ {description} confirmed — block {receipt.blockNumber}")
+                    return tx_hash_hex
+                else:
+                    logger.error(f"❌ {description} FAILED — tx: {tx_hash_hex}")
+                    if attempt == 0:
+                        logger.info("Retrying transaction...")
+                        # Bump nonce for retry
+                        tx["nonce"] = self._w3.eth.get_transaction_count(self._wallet_address)
+                        tx["gasPrice"] = int(tx["gasPrice"] * 1.15)  # +15% gas for retry
+                    continue
+
+            except Exception as e:
+                logger.error(f"❌ {description} error (attempt {attempt+1}): {e}")
+                if attempt == 0:
+                    logger.info("Retrying transaction...")
+                    time.sleep(2)
+                    try:
+                        tx["nonce"] = self._w3.eth.get_transaction_count(self._wallet_address)
+                    except Exception:
+                        pass
+
+        return None
+
+    # ─── Core Interface (mirrors PaperTrader) ────────────────────────────────
+
+    def enter_trade(self, signal, window) -> Optional[LiveTrade]:
+        """
+        Execute a live trade on PancakeSwap Prediction V2.
+
+        Calls betBull(epoch) or betBear(epoch) with BNB value = position_size_usdc / bnb_price.
+
+        Args:
+            signal: Strategy Signal object.
+            window: Current WindowInfo.
+
+        Returns:
+            LiveTrade object, or None if rejected/failed.
+        """
+        # Get current BNB price from web3 is not possible directly;
+        # we estimate from the signal context (signal.yes_price is irrelevant here)
+        # We need bnb_price — fetch it from Binance or a fallback.
+        bnb_price = self._get_bnb_price_fallback()
+        if bnb_price is None or bnb_price <= 0:
+            logger.error("Cannot determine BNB price — aborting trade.")
+            return None
+
+        # Safeguard checks
+        if not self._check_safeguards(signal.position_size_usdc, bnb_price):
+            return None
+
+        # Get current epoch from contract
+        try:
+            epoch = self._contract.functions.currentEpoch().call()
+        except Exception as e:
+            logger.error(f"Cannot read currentEpoch(): {e}")
+            return None
+
+        bet_bnb = signal.position_size_usdc / bnb_price
+        bet_wei = int(bet_bnb * 1e18)
+
+        self._trade_counter += 1
+        trade_id = f"LT-{int(time.time())}-{self._trade_counter:04d}"
+
+        # Build transaction
+        gas_price = self._estimate_gas_price()
+        nonce = self._w3.eth.get_transaction_count(self._wallet_address)
+
+        if signal.side == "YES":
+            fn = self._contract.functions.betBull(epoch)
+            description = f"betBull(epoch={epoch})"
+        else:
+            fn = self._contract.functions.betBear(epoch)
+            description = f"betBear(epoch={epoch})"
+
+        try:
+            gas_estimate = fn.estimate_gas({
+                "from": self._wallet_address,
+                "value": bet_wei,
+            })
+            gas_limit = int(gas_estimate * 1.2)  # +20% buffer
+        except Exception as e:
+            logger.warning(f"Gas estimation failed: {e} — using default 200000")
+            gas_limit = 200_000
+
+        tx = fn.build_transaction({
+            "from": self._wallet_address,
+            "value": bet_wei,
+            "gas": gas_limit,
+            "gasPrice": gas_price,
+            "nonce": nonce,
+            "chainId": 56,  # BSC mainnet
+        })
+
+        # Execute
+        tx_hash = self._send_transaction(tx, description)
+        tx_status = "success" if tx_hash else "failed"
+
+        if tx_hash is None:
+            logger.error(f"Trade {trade_id} failed — transaction not confirmed.")
+            return None
+
+        # Build trade record
+        entry_price = signal.yes_price if signal.side == "YES" else (1.0 - signal.yes_price)
+
+        trade = LiveTrade(
+            trade_id=trade_id,
+            timestamp_entry=time.time(),
+            timestamp_exit=None,
+            side=signal.side,
+            entry_price=entry_price,
+            position_size_usdc=signal.position_size_usdc,
+            bet_bnb=bet_bnb,
+            bnb_price_at_entry=bnb_price,
+            p_up_at_entry=signal.p_up,
+            yes_price_at_entry=signal.yes_price,
+            edge_at_entry=signal.edge,
+            kelly_fraction=signal.kelly_fraction,
+            window_start_ts=window.window_start_ts,
+            window_end_ts=window.window_end_ts,
+            window_index=window.window_index,
+            epoch=epoch,
+            is_mock=signal.is_mock,
+            tx_hash=tx_hash,
+            tx_status=tx_status,
+            outcome="PENDING",
+        )
+
+        self._trades.append(trade)
+        self._pending_trades.append(trade)
+        self.metrics.total_trades += 1
+        self.metrics.pending += 1
+        self.metrics.total_wagered += trade.position_size_usdc
+
+        self._save_trades()
+
+        logger.info(
+            f"🔴 LIVE trade entered: {trade_id} | "
+            f"{trade.side} @ epoch={epoch} | "
+            f"{bet_bnb:.6f} BNB (${signal.position_size_usdc:.2f}) | "
+            f"edge={signal.edge:.3f} | tx={tx_hash}"
+        )
+
+        return trade
+
+    def resolve_trades(self, window_index: int, bnb_open: float, bnb_close: float):
+        """
+        Resolve pending trades for a completed window.
+        Also triggers claim for winning trades if auto_claim is enabled.
+
+        Args:
+            window_index: The window that just completed.
+            bnb_open: BNB price at window start.
+            bnb_close: BNB price at window end.
+        """
+        resolved = []
+        still_pending = []
+        bnb_went_up = bnb_close > bnb_open
+
+        for trade in self._pending_trades:
+            if trade.window_index != window_index:
+                still_pending.append(trade)
+                continue
+
+            if trade.side == "YES":
+                won = bnb_went_up
+            else:
+                won = not bnb_went_up
+
+            trade.bnb_open = bnb_open
+            trade.bnb_close = bnb_close
+            trade.timestamp_exit = time.time()
+
+            if won:
+                # Approximate payout: position_size / entry_price
+                shares = trade.position_size_usdc / trade.entry_price
+                payout = shares * 1.0
+                trade.pnl_usdc = round(payout - trade.position_size_usdc, 4)
+                trade.payout_per_share = 1.0
+                trade.outcome = "WIN"
+                self.metrics.wins += 1
+            else:
+                trade.pnl_usdc = -trade.position_size_usdc
+                trade.payout_per_share = 0.0
+                trade.outcome = "LOSS"
+                self.metrics.losses += 1
+
+            self.metrics.pending -= 1
+            self.metrics.total_pnl = round(self.metrics.total_pnl + trade.pnl_usdc, 4)
+            self.metrics.daily_pnl = round(self.metrics.daily_pnl + trade.pnl_usdc, 4)
+
+            result_emoji = "✅" if won else "❌"
+            logger.info(
+                f"{result_emoji} Live trade resolved: {trade.trade_id} | "
+                f"{trade.side} | BNB {bnb_open:.2f}→{bnb_close:.2f} | "
+                f"PnL: ${trade.pnl_usdc:+.2f} | tx={trade.tx_hash}"
+            )
+
+            resolved.append(trade)
+
+        self._pending_trades = still_pending
+
+        # Auto-claim winning epochs
+        if self.auto_claim and resolved:
+            winning_epochs = [t.epoch for t in resolved if t.outcome == "WIN"]
+            # Wait a few seconds for BSC to confirm the round settlement
+            if winning_epochs:
+                logger.info(f"⏳ Waiting 15s for round settlement before claiming...")
+                time.sleep(15)
+                self.claim_winnings(winning_epochs)
+
+        if resolved:
+            edges = [t.edge_at_entry for t in self._trades]
+            self.metrics.avg_edge = sum(edges) / len(edges) if edges else 0.0
+            self._save_trades()
+            logger.info(f"📊 {self.metrics.summary()}")
+
+    def claim_winnings(self, epochs: list[int]):
+        """
+        Call claim(uint256[] epochs) on the contract to collect winnings.
+
+        Args:
+            epochs: List of epoch numbers to claim.
+        """
+        if not epochs:
+            return
+
+        # Filter to claimable epochs first
+        claimable = []
+        for epoch in epochs:
+            try:
+                is_claimable = self._contract.functions.claimable(
+                    epoch, self._wallet_address
+                ).call()
+                is_refundable = self._contract.functions.refundable(
+                    epoch, self._wallet_address
+                ).call()
+                if is_claimable or is_refundable:
+                    claimable.append(epoch)
+                else:
+                    logger.debug(f"Epoch {epoch} not yet claimable/refundable — skipping")
+            except Exception as e:
+                logger.warning(f"claimable() check failed for epoch {epoch}: {e}")
+                claimable.append(epoch)  # Try anyway
+
+        if not claimable:
+            logger.info("No claimable epochs found.")
+            return
+
+        gas_price = self._estimate_gas_price()
+        nonce = self._w3.eth.get_transaction_count(self._wallet_address)
+
+        fn = self._contract.functions.claim(claimable)
+        try:
+            gas_estimate = fn.estimate_gas({"from": self._wallet_address})
+            gas_limit = int(gas_estimate * 1.2)
+        except Exception as e:
+            logger.warning(f"Gas estimation for claim failed: {e} — using 150000")
+            gas_limit = 150_000
+
+        tx = fn.build_transaction({
+            "from": self._wallet_address,
+            "gas": gas_limit,
+            "gasPrice": gas_price,
+            "nonce": nonce,
+            "chainId": 56,
+        })
+
+        tx_hash = self._send_transaction(tx, f"claim(epochs={claimable})")
+        if tx_hash:
+            logger.info(f"💰 Claimed winnings for epochs {claimable} — tx: {tx_hash}")
+            # Update claim_tx_hash on matching trades
+            for trade in self._trades:
+                if trade.epoch in claimable:
+                    trade.claim_tx_hash = tx_hash
+            self._save_trades()
+        else:
+            logger.error(f"❌ Claim failed for epochs {claimable}")
+
+    # ─── Persistence ─────────────────────────────────────────────────────────
+
+    def _load_trades(self):
+        """Load existing live trades from the log file."""
+        if not os.path.exists(self.log_file):
+            logger.info(f"No existing live trades at {self.log_file}. Starting fresh.")
+            return
+
+        try:
+            with open(self.log_file) as f:
+                data = json.load(f)
+            trades_data = data.get("trades", [])
+            logger.info(f"Loaded {len(trades_data)} existing live trades from {self.log_file}")
+
+            for t_dict in trades_data:
+                trade = LiveTrade(**t_dict)
+                self._trades.append(trade)
+                if trade.outcome == "PENDING" or trade.outcome is None:
+                    self._pending_trades.append(trade)
+
+            self._recompute_metrics()
+
+        except (json.JSONDecodeError, TypeError, KeyError) as e:
+            logger.warning(f"Failed to load live trades from {self.log_file}: {e}. Starting fresh.")
+
+    def _recompute_metrics(self):
+        """Recompute all metrics from the full trades list."""
+        wins = [t for t in self._trades if t.outcome == "WIN"]
+        losses = [t for t in self._trades if t.outcome == "LOSS"]
+        pending = [t for t in self._trades if t.outcome in ("PENDING", None)]
+
+        self.metrics.total_trades = len(self._trades)
+        self.metrics.wins = len(wins)
+        self.metrics.losses = len(losses)
+        self.metrics.pending = len(pending)
+        self.metrics.total_pnl = sum(t.pnl_usdc for t in self._trades if t.pnl_usdc is not None)
+        self.metrics.total_wagered = sum(t.position_size_usdc for t in self._trades)
+
+        edges = [t.edge_at_entry for t in self._trades]
+        self.metrics.avg_edge = sum(edges) / len(edges) if edges else 0.0
+
+    def _save_trades(self):
+        """Persist all live trades to the log file."""
+        os.makedirs(os.path.dirname(self.log_file) if os.path.dirname(self.log_file) else ".", exist_ok=True)
+
+        data = {
+            "metadata": {
+                "last_updated": time.time(),
+                "last_updated_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "total_trades": len(self._trades),
+                "mode": "LIVE",
+            },
+            "metrics": {
+                "total_pnl": self.metrics.total_pnl,
+                "daily_pnl": self.metrics.daily_pnl,
+                "total_wagered": self.metrics.total_wagered,
+                "wins": self.metrics.wins,
+                "losses": self.metrics.losses,
+                "pending": self.metrics.pending,
+                "win_rate": self.metrics.win_rate,
+                "roi": self.metrics.roi,
+                "avg_edge": self.metrics.avg_edge,
+            },
+            "trades": [t.to_dict() for t in self._trades],
+        }
+
+        with open(self.log_file, "w") as f:
+            json.dump(data, f, indent=2)
+
+        logger.debug(f"Live trades saved to {self.log_file}")
+
+    # ─── Utilities ───────────────────────────────────────────────────────────
+
+    def _get_bnb_price_fallback(self) -> Optional[float]:
+        """
+        Fetch BNB/USDT price from Binance REST API as fallback.
+        Used to convert position_size_usdc → BNB.
+        """
+        try:
+            import requests
+            resp = requests.get(
+                "https://api.binance.com/api/v3/ticker/price",
+                params={"symbol": "BNBUSDT"},
+                timeout=5,
+            )
+            data = resp.json()
+            return float(data["price"])
+        except Exception as e:
+            logger.error(f"Cannot fetch BNB price from Binance: {e}")
+            return None
+
+    def print_summary(self):
+        """Print current live trading summary."""
+        bnb_balance = "N/A"
+        try:
+            bnb_balance = f"{self.get_bnb_balance():.6f} BNB"
+        except Exception:
+            pass
+
+        print(f"\n{'='*60}")
+        print(f"  🔴 LIVE TRADING SUMMARY")
+        print(f"{'='*60}")
+        print(f"  Wallet:      {self._wallet_address}")
+        print(f"  Balance:     {bnb_balance}")
+        print(f"  Total PnL:   ${self.metrics.total_pnl:+.2f}")
+        print(f"  Daily PnL:   ${self.metrics.daily_pnl:+.2f} (limit: -${self.max_daily_loss_usdc:.0f})")
+        print(f"  Total trades: {self.metrics.total_trades}")
+        print(f"  Win rate:    {self.metrics.win_rate:.1%}")
+        print(f"  Wins:        {self.metrics.wins}")
+        print(f"  Losses:      {self.metrics.losses}")
+        print(f"  Pending:     {self.metrics.pending}")
+        print(f"  ROI:         {self.metrics.roi:.2%}")
+        print(f"  Avg edge:    {self.metrics.avg_edge:.3f}")
+        print(f"  Log file:    {self.log_file}")
+        print(f"{'='*60}\n")

@@ -1,11 +1,10 @@
 #!/bin/bash
-# PancakeSwap BNB/USD 5mn Paper Trader — WSL2 Launcher
+# PancakeSwap BNB/USD 5mn Trading Bot — WSL2 Launcher
 
 REPO="/home/joris/.openclaw/workspace/repos/bnb-updown"
 
 echo "========================================"
-echo "  PancakeSwap BNB/USD 5mn Paper Trader"
-echo "  (BSC live data)"
+echo "  PancakeSwap BNB/USD 5mn Trading Bot"
 echo "========================================"
 echo ""
 
@@ -21,7 +20,5 @@ fi
 source venv/bin/activate
 venv/bin/python3 -m pip install -r requirements.txt -q
 
-# Start the bot (always fresh — resets paper trading history)
-echo "Starting bot (fresh start, live BSC data)..."
-echo ""
-python src/main.py --fresh "$@"
+# Launch bot with interactive menu (no --fresh, no --live → shows menu)
+python src/main.py "$@"

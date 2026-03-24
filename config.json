@@ -29,6 +29,13 @@
     "log_file": "data/paper_trades.json",
     "simulate_latency_ms": 200
   },
+  "live_trading": {
+    "enabled": false,
+    "log_file": "data/live_trades.json",
+    "max_daily_loss_usdc": 100.0,
+    "gas_price_buffer_pct": 0.10,
+    "auto_claim": true
+  },
   "logging": {
     "level": "INFO",
     "format": "%(asctime)s [%(levelname)s] %(name)s: %(message)s"

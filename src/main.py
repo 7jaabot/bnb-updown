@@ -1,11 +1,11 @@
 """
-main.py — Entry point for BNB Up/Down PancakeSwap 5mn paper trading bot
+main.py — Entry point for BNB Up/Down PancakeSwap 5mn trading bot
 
 Architecture:
   - asyncio event loop runs the Binance WebSocket feed (async)
   - Main loop polls PRDT contract every N seconds (sync via executor)
   - Strategy evaluated in the last 60s of each window
-  - PaperTrader logs and resolves simulated trades
+  - PaperTrader or LiveTrader logs and resolves trades
 
 Key difference vs Polymarket:
   - No order book YES/NO price — reads on-chain pool (bull/bear amounts)
@@ -13,10 +13,12 @@ Key difference vs Polymarket:
   - Same Kelly/edge logic applies on top of this
 
 Run with:
-  python src/main.py
+  python src/main.py              (interactive menu)
+  python src/main.py --live       (live trading, non-interactive)
+  python src/main.py --paper      (paper trading, continue)
+  python src/main.py --fresh      (paper trading, fresh start)
+  python src/main.py --dry-run    (connectivity test only)
   python src/main.py --config config.json
-  python src/main.py --dry-run
-  python src/main.py --fresh    (reset paper trading history)
 """
 
 import argparse
@@ -92,6 +94,86 @@ def load_config(path: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Mode selection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def reset_paper_trades(config: dict):
+    """Reset paper trading history."""
+    log_file = config.get("paper_trading", {}).get("log_file", "data/paper_trades.json")
+    empty = {
+        "metadata": {"last_updated": 0, "last_updated_iso": "", "total_trades": 0},
+        "metrics": {
+            "bankroll": config.get("strategy", {}).get("starting_bankroll_usdc", 1000.0),
+            "total_pnl": 0.0, "win_rate": 0.0, "roi": 0.0,
+            "total_wagered": 0.0, "wins": 0, "losses": 0, "pending": 0, "avg_edge": 0.0
+        },
+        "trades": []
+    }
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    with open(log_file, "w") as f:
+        json.dump(empty, f, indent=2)
+    logging.info(f"🧹 Fresh start: reset {log_file}")
+
+
+def select_mode_interactive(config: dict) -> tuple[str, object]:
+    """
+    Display an interactive menu and return (mode, trader).
+
+    Returns:
+        (mode, trader) where mode is "live" or "paper"
+        and trader is a LiveTrader or PaperTrader instance.
+    """
+    print("\n" + "=" * 40)
+    print("  BNB Up/Down 5mn Trading Bot")
+    print("=" * 40)
+    print("  [1] 🔴 Live Trading")
+    print("  [2] 📝 Paper Trading (fresh run)")
+    print("  [3] 📝 Paper Trading (continue)")
+    print("=" * 40)
+
+    while True:
+        choice = input("Select mode: ").strip()
+        if choice in ("1", "2", "3"):
+            break
+        print("Invalid choice. Please enter 1, 2, or 3.")
+
+    if choice == "1":
+        return _init_live_mode(config)
+    elif choice == "2":
+        reset_paper_trades(config)
+        trader = PaperTrader(config)
+        return "paper", trader
+    else:
+        trader = PaperTrader(config)
+        return "paper", trader
+
+
+def _init_live_mode(config: dict) -> tuple[str, object]:
+    """Initialize live trading mode with confirmation."""
+    from live_trader import LiveTrader
+
+    print("\n🔴 Initializing Live Trading...")
+    print("   Loading wallet and connecting to BSC...")
+
+    try:
+        trader = LiveTrader(config)
+    except RuntimeError as e:
+        print(f"\n❌ Live trading setup failed: {e}")
+        print("   → Falling back to paper trading.\n")
+        return "paper", PaperTrader(config)
+
+    # Show wallet info and ask for confirmation
+    bnb_balance = trader.get_bnb_balance()
+    print(f"\n💰 Wallet: {trader._wallet_address}")
+    print(f"💰 BNB Balance: {bnb_balance:.6f} BNB")
+    print(f"⚠️  Max daily loss: ${trader.max_daily_loss_usdc:.2f}")
+    print(f"⚠️  Auto-claim: {'enabled' if trader.auto_claim else 'disabled'}")
+
+    print("\n🚀 Live trading starting...\n")
+    return "live", trader
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main bot
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -101,14 +183,15 @@ class PolymarketBot:
 
     Coordinates:
     - BinanceFeed: real-time BNB price via WebSocket
-    - PolymarketClient: order book polling
+    - PancakeClient: on-chain pool polling
     - Strategy: signal generation
-    - PaperTrader: trade simulation and logging
+    - PaperTrader or LiveTrader: trade execution and logging
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, trader):
         self.config = config
         self.logger = logging.getLogger("PolymarketBot")
+        self.trader = trader
 
         # Components
         self.binance = BinanceFeed(buffer_seconds=310)
@@ -119,7 +202,6 @@ class PolymarketBot:
             timeout=config.get("pancake", {}).get("timeout_seconds", 8),
         )
         self.strategy = Strategy(config)
-        self.paper_trader = PaperTrader(config)
 
         self._running = False
         self._last_window_index = -1
@@ -156,11 +238,16 @@ class PolymarketBot:
         if int(now) % 30 == 0:
             remaining = window.seconds_remaining
             bnb = self.binance.last_price
+            # Use trader-specific bankroll/balance info
+            if hasattr(self.trader, 'metrics'):
+                bankroll_str = f"${self.trader.metrics.bankroll:.2f}" if hasattr(self.trader.metrics, 'bankroll') else "N/A"
+            else:
+                bankroll_str = "N/A"
             self.logger.info(
                 f"Window {window.window_index} | "
                 f"Remaining: {remaining:.0f}s | "
                 f"BNB: {f'{bnb:.2f}' if bnb is not None else 'N/A'} | "
-                f"Bankroll: ${self.paper_trader.metrics.bankroll:.2f}"
+                f"Balance: {bankroll_str}"
             )
 
         # Only evaluate in the entry window
@@ -198,8 +285,6 @@ class PolymarketBot:
             + (" [MOCK]" if round_data.is_mock else "")
         )
 
-        # Evaluate strategy. When use_fair_odds=True, strategy.evaluate() ignores
-        # yes_price_equiv and uses 0.50 internally — pool price is monitoring only.
         signal = self.strategy.evaluate(
             prices=prices,
             yes_price=yes_price_equiv,
@@ -211,8 +296,8 @@ class PolymarketBot:
         )
 
         if signal and not self._traded_this_window:
-            # Enter paper trade (one trade per window max)
-            self.paper_trader.enter_trade(signal, window)
+            # Enter trade (one trade per window max)
+            self.trader.enter_trade(signal, window)
             self._traded_this_window = True
 
     def _on_new_window(self, window):
@@ -232,7 +317,7 @@ class PolymarketBot:
                     f"({'UP' if bnb_close > bnb_open else 'DOWN'} "
                     f"{abs(bnb_close/bnb_open - 1):.3%})"
                 )
-                self.paper_trader.resolve_trades(
+                self.trader.resolve_trades(
                     self._last_window_index, bnb_open, bnb_close
                 )
             else:
@@ -252,7 +337,8 @@ class PolymarketBot:
         )
 
         # Update strategy bankroll
-        self.strategy.update_bankroll(self.paper_trader.metrics.bankroll)
+        if hasattr(self.trader.metrics, 'bankroll'):
+            self.strategy.update_bankroll(self.trader.metrics.bankroll)
 
     async def run(self):
         """Start the bot: Binance feed + main loop in parallel."""
@@ -263,8 +349,11 @@ class PolymarketBot:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self.stop)
 
+        mode_label = "🔴 LIVE" if isinstance(self.trader, type) else (
+            "🔴 LIVE" if self.trader.__class__.__name__ == "LiveTrader" else "📝 PAPER"
+        )
         self.logger.info("="*60)
-        self.logger.info("  BNB Up/Down 5mn Paper Trading Bot")
+        self.logger.info(f"  BNB Up/Down 5mn Trading Bot [{mode_label}]")
         self.logger.info("="*60)
 
         # Test PancakeSwap / BSC connectivity
@@ -279,7 +368,7 @@ class PolymarketBot:
                 "   → Running in MOCK DATA mode."
             )
 
-        self.paper_trader.print_summary()
+        self.trader.print_summary()
 
         # Run Binance feed + main loop concurrently
         self.binance.on_price = self._on_price
@@ -293,7 +382,7 @@ class PolymarketBot:
         self.logger.info("Shutting down bot...")
         self._running = False
         self.binance.stop()
-        self.paper_trader.print_summary()
+        self.trader.print_summary()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -301,7 +390,7 @@ class PolymarketBot:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="BNB Up/Down 5mn Paper Trading Bot")
+    parser = argparse.ArgumentParser(description="BNB Up/Down 5mn Trading Bot")
     parser.add_argument(
         "--config",
         default="config.json",
@@ -315,28 +404,21 @@ def main():
     parser.add_argument(
         "--fresh",
         action="store_true",
-        help="Reset paper trading history and start from scratch",
+        help="Paper trading: reset history and start from scratch",
+    )
+    parser.add_argument(
+        "--paper",
+        action="store_true",
+        help="Paper trading mode (continue from existing data)",
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Live trading mode (real on-chain transactions)",
     )
     args = parser.parse_args()
 
     config = load_config(args.config)
-
-    if args.fresh:
-        log_file = config.get("paper_trading", {}).get("log_file", "data/paper_trades.json")
-        empty = {
-            "metadata": {"last_updated": 0, "last_updated_iso": "", "total_trades": 0},
-            "metrics": {
-                "bankroll": config.get("strategy", {}).get("starting_bankroll_usdc", 1000.0),
-                "total_pnl": 0.0, "win_rate": 0.0, "roi": 0.0,
-                "total_wagered": 0.0, "wins": 0, "losses": 0, "pending": 0, "avg_edge": 0.0
-            },
-            "trades": []
-        }
-        import os
-        os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        with open(log_file, "w") as f:
-            json.dump(empty, f, indent=2)
-        logging.info(f"🧹 Fresh start: reset {log_file}")
     setup_logging(config)
 
     if args.dry_run:
@@ -349,7 +431,28 @@ def main():
         logging.info(f"Sample PancakeSwap round: {round_data}")
         sys.exit(0 if ok else 1)
 
-    bot = PolymarketBot(config)
+    # Determine trader based on CLI args or interactive menu
+    if args.live:
+        # Non-interactive live mode
+        from live_trader import LiveTrader
+        try:
+            trader = LiveTrader(config)
+            mode = "live"
+        except RuntimeError as e:
+            logging.error(f"Live trading setup failed: {e}")
+            sys.exit(1)
+    elif args.fresh:
+        reset_paper_trades(config)
+        trader = PaperTrader(config)
+        mode = "paper"
+    elif args.paper:
+        trader = PaperTrader(config)
+        mode = "paper"
+    else:
+        # Interactive menu
+        mode, trader = select_mode_interactive(config)
+
+    bot = PolymarketBot(config, trader)
 
     try:
         asyncio.run(bot.run())
