@@ -44,17 +44,34 @@ from paper_trader import PaperTrader
 # Logging setup
 # ─────────────────────────────────────────────────────────────────────────────
 
-def setup_logging(config: dict):
-    """Configure logging from config."""
+def setup_logging(config: dict, dashboard_mode: bool = False):
+    """Configure logging from config.
+
+    When dashboard_mode=True, reduces console handler to WARNING level
+    (dashboard is the primary display) but keeps file logging at full level.
+    """
     cfg = config.get("logging", {})
     level_str = cfg.get("level", "INFO")
     level = getattr(logging, level_str, logging.INFO)
     fmt = cfg.get("format", "%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+
+    # File handler — always at configured level
+    log_file = cfg.get("file", "data/bot.log")
+    os.makedirs(os.path.dirname(log_file) if os.path.dirname(log_file) else ".", exist_ok=True)
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setLevel(level)
+    file_handler.setFormatter(logging.Formatter(fmt))
+    root_logger.addHandler(file_handler)
+
+    # Console handler — WARNING only when dashboard is active
+    console_level = logging.WARNING if dashboard_mode else level
     try:
         import colorlog
-        handler = colorlog.StreamHandler()
-        handler.setFormatter(colorlog.ColoredFormatter(
+        console_handler = colorlog.StreamHandler()
+        console_handler.setFormatter(colorlog.ColoredFormatter(
             f"%(log_color)s{fmt}",
             log_colors={
                 "DEBUG": "cyan",
@@ -65,10 +82,12 @@ def setup_logging(config: dict):
             }
         ))
     except ImportError:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter(fmt))
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(logging.Formatter(fmt))
 
-    logging.basicConfig(level=level, handlers=[handler], force=True)
+    console_handler.setLevel(console_level)
+    root_logger.addHandler(console_handler)
+    root_logger.setLevel(logging.DEBUG)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -186,12 +205,14 @@ class PolymarketBot:
     - PancakeClient: on-chain pool polling
     - Strategy: signal generation
     - PaperTrader or LiveTrader: trade execution and logging
+    - Dashboard: Rich live terminal display
     """
 
-    def __init__(self, config: dict, trader):
+    def __init__(self, config: dict, trader, mode: str):
         self.config = config
         self.logger = logging.getLogger("PolymarketBot")
         self.trader = trader
+        self.mode = mode  # "paper" or "live"
 
         # Components
         self.binance = BinanceFeed(buffer_seconds=310)
@@ -203,11 +224,24 @@ class PolymarketBot:
         )
         self.strategy = Strategy(config)
 
+        # Dashboard — imported here so Rich is only required when running the bot
+        from dashboard import Dashboard
+        self.dashboard = Dashboard(trader=trader, binance=self.binance, mode=mode)
+
         self._running = False
         self._last_window_index = -1
         self._last_bnb_window_open: float | None = None
         self._traded_this_window = False
         self._poll_interval = config.get("polymarket", {}).get("poll_interval_seconds", 5)
+        self._live_ref = None  # Rich Live instance (set during run())
+
+    def _refresh_display(self):
+        """Push a fresh render to the Live display if it's active."""
+        if self._live_ref is not None:
+            try:
+                self._live_ref.update(self.dashboard.render())
+            except Exception:
+                pass
 
     def _on_price(self, pp: PricePoint):
         """Called on each new Binance trade price."""
@@ -225,20 +259,35 @@ class PolymarketBot:
 
             await asyncio.sleep(self._poll_interval)
 
+    async def _update_live_balance(self):
+        """Periodically refresh cached live wallet balance (non-blocking)."""
+        while self._running:
+            if self.mode == "live":
+                try:
+                    loop = asyncio.get_event_loop()
+                    balance = await loop.run_in_executor(None, self.trader.get_bnb_balance)
+                    self.dashboard._cached_bnb_balance = balance
+                    self.dashboard._last_balance_update = time.time()
+                except Exception as e:
+                    self.logger.debug(f"Balance refresh failed: {e}")
+            await asyncio.sleep(30)
+
     async def _tick(self):
         """One iteration of the main loop."""
         now = time.time()
         window = get_current_window(now)
 
+        # Update window info in dashboard
+        self.dashboard.update_window(window)
+
         # Detect new window
         if window.window_index != self._last_window_index:
             self._on_new_window(window)
 
-        # Log status periodically
+        # Periodic status log (every 30s) — goes to file only (dashboard shows live)
         if int(now) % 30 == 0:
             remaining = window.seconds_remaining
             bnb = self.binance.last_price
-            # Use trader-specific bankroll/balance info
             if hasattr(self.trader, 'metrics'):
                 bankroll_str = f"${self.trader.metrics.bankroll:.2f}" if hasattr(self.trader.metrics, 'bankroll') else "N/A"
             else:
@@ -252,7 +301,11 @@ class PolymarketBot:
 
         # Only evaluate in the entry window
         if window.seconds_remaining > self.strategy.entry_window_seconds:
+            self.dashboard.update_status("⏳ Waiting for entry window")
+            self._refresh_display()
             return
+
+        self.dashboard.update_status("🔍 Evaluating signal")
 
         # Get current price series for this window
         window_prices_raw = self.binance.get_window_prices(window.window_start_ts)
@@ -260,6 +313,7 @@ class PolymarketBot:
 
         if not prices:
             self.logger.debug("No prices in window yet.")
+            self._refresh_display()
             return
 
         # Fetch current PancakeSwap BNB/USD round from BSC
@@ -268,6 +322,8 @@ class PolymarketBot:
 
         if round_data is None:
             self.logger.warning("Could not get PancakeSwap round — skipping this tick.")
+            self.dashboard.update_status("⚠️ PancakeSwap unavailable")
+            self._refresh_display()
             return
 
         yes_price_equiv = round_data.yes_price_equiv
@@ -285,6 +341,14 @@ class PolymarketBot:
             + (" [MOCK]" if round_data.is_mock else "")
         )
 
+        # Log evaluation to dashboard
+        bnb_price_now = prices[-1] if prices else None
+        self.dashboard.log(
+            f"Evaluating: P(Up)=? | Pool: {round_data.total_bnb:.1f} BNB "
+            f"(bull {round_data.bull_ratio:.0%} / bear {round_data.bear_ratio:.0%})"
+            + (" [MOCK]" if round_data.is_mock else "")
+        )
+
         signal = self.strategy.evaluate(
             prices=prices,
             yes_price=yes_price_equiv,
@@ -295,10 +359,30 @@ class PolymarketBot:
             pool_bear_bnb=round_data.bear_bnb,
         )
 
-        if signal and not self._traded_this_window:
-            # Enter trade (one trade per window max)
-            self.trader.enter_trade(signal, window)
-            self._traded_this_window = True
+        if signal:
+            if not self._traded_this_window:
+                # Log signal to dashboard
+                self.dashboard.log(
+                    f"🎯 Signal: {signal.side} @ edge={signal.edge:.2f} | ${signal.position_size_usdc:.2f}"
+                )
+                self.dashboard.update_status(f"🎯 Entering {signal.side} trade...")
+                self._refresh_display()
+
+                # Enter trade (one trade per window max)
+                self.trader.enter_trade(signal, window)
+                self._traded_this_window = True
+
+                self.dashboard.update_status(f"✅ Trade entered: {signal.side}")
+                self.dashboard.log(
+                    f"✅ Trade entered: bet{signal.side.capitalize()} epoch #{window.window_index}"
+                )
+            else:
+                self.dashboard.update_status("⏸ Already traded this window")
+        else:
+            # No signal — show last evaluation status
+            self.dashboard.update_status("🔍 Evaluating signal")
+
+        self._refresh_display()
 
     def _on_new_window(self, window):
         """Called when a new 5-minute window starts."""
@@ -311,11 +395,17 @@ class PolymarketBot:
             if prev_window_prices:
                 bnb_open = prev_window_prices[0].price
                 bnb_close = prev_window_prices[-1].price
+                direction = "UP" if bnb_close > bnb_open else "DOWN"
+                pct_change = abs(bnb_close / bnb_open - 1)
                 self.logger.info(
                     f"🔚 Window {self._last_window_index} ended: "
                     f"BNB {bnb_open:.2f} → {bnb_close:.2f} "
                     f"({'UP' if bnb_close > bnb_open else 'DOWN'} "
-                    f"{abs(bnb_close/bnb_open - 1):.3%})"
+                    f"{pct_change:.3%})"
+                )
+                self.dashboard.log(
+                    f"🔚 Window #{self._last_window_index} resolved: "
+                    f"BNB {direction} {pct_change:.2%}"
                 )
                 self.trader.resolve_trades(
                     self._last_window_index, bnb_open, bnb_close
@@ -324,6 +414,9 @@ class PolymarketBot:
                 self.logger.warning(
                     f"No prices for window {self._last_window_index} — cannot resolve trades."
                 )
+                self.dashboard.log(
+                    f"⚠️ Window #{self._last_window_index}: no price data — cannot resolve"
+                )
 
         # Record new window open price
         self._last_window_index = window.window_index
@@ -331,17 +424,24 @@ class PolymarketBot:
         bnb = self.binance.last_price
         self._last_bnb_window_open = bnb
 
+        bnb_str = f"${bnb:.2f}" if bnb is not None else "N/A"
         self.logger.info(
             f"🆕 Window {window.window_index} started | "
-            f"BNB open: {f'{bnb:.2f}' if bnb is not None else 'N/A'}"
+            f"BNB open: {bnb_str}"
         )
+        self.dashboard.log(
+            f"Window #{window.window_index} started | BNB: {bnb_str}"
+        )
+        self.dashboard.update_status("⏳ Waiting for entry window")
 
         # Update strategy bankroll
         if hasattr(self.trader.metrics, 'bankroll'):
             self.strategy.update_bankroll(self.trader.metrics.bankroll)
 
+        self._refresh_display()
+
     async def run(self):
-        """Start the bot: Binance feed + main loop in parallel."""
+        """Start the bot: Binance feed + main loop in parallel, inside Rich Live."""
         self._running = True
 
         # Set up graceful shutdown on Ctrl+C
@@ -349,33 +449,47 @@ class PolymarketBot:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self.stop)
 
-        mode_label = "🔴 LIVE" if isinstance(self.trader, type) else (
-            "🔴 LIVE" if self.trader.__class__.__name__ == "LiveTrader" else "📝 PAPER"
-        )
-        self.logger.info("="*60)
-        self.logger.info(f"  BNB Up/Down 5mn Trading Bot [{mode_label}]")
-        self.logger.info("="*60)
+        # Re-configure logging: reduce console to WARNING now that dashboard is active
+        setup_logging(self.config, dashboard_mode=True)
 
-        # Test PancakeSwap / BSC connectivity
-        self.logger.info("Testing PancakeSwap BNB/USD (BSC) connectivity...")
-        loop = asyncio.get_event_loop()
-        api_ok = await loop.run_in_executor(None, self.pancake.check_connectivity)
-        if api_ok:
-            self.logger.info("✅ PancakeSwap: BSC reachable — live on-chain data")
-        else:
-            self.logger.warning(
-                "⚠️  PancakeSwap: BSC unreachable\n"
-                "   → Running in MOCK DATA mode."
+        # Start the Rich Live display
+        live = self.dashboard.start()
+        live.start()
+        self._live_ref = live
+
+        try:
+            self.logger.info("="*60)
+            self.logger.info(f"  BNB Up/Down 5mn Trading Bot [{self.mode.upper()}]")
+            self.logger.info("="*60)
+
+            # Test PancakeSwap / BSC connectivity
+            self.dashboard.log("Testing PancakeSwap/BSC connectivity...")
+            self._refresh_display()
+
+            loop = asyncio.get_event_loop()
+            api_ok = await loop.run_in_executor(None, self.pancake.check_connectivity)
+            if api_ok:
+                self.logger.info("✅ PancakeSwap: BSC reachable — live on-chain data")
+                self.dashboard.log("✅ PancakeSwap connected — live on-chain data")
+            else:
+                self.logger.warning(
+                    "⚠️  PancakeSwap: BSC unreachable → Running in MOCK DATA mode."
+                )
+                self.dashboard.log("⚠️  PancakeSwap unreachable — MOCK DATA mode")
+
+            self.trader.print_summary()
+            self._refresh_display()
+
+            # Run Binance feed + main loop + balance refresh concurrently
+            self.binance.on_price = self._on_price
+            await asyncio.gather(
+                self.binance.run(),
+                self._run_main_loop(),
+                self._update_live_balance(),
             )
-
-        self.trader.print_summary()
-
-        # Run Binance feed + main loop concurrently
-        self.binance.on_price = self._on_price
-        await asyncio.gather(
-            self.binance.run(),
-            self._run_main_loop(),
-        )
+        finally:
+            live.stop()
+            self._live_ref = None
 
     def stop(self):
         """Graceful shutdown."""
@@ -449,10 +563,10 @@ def main():
         trader = PaperTrader(config)
         mode = "paper"
     else:
-        # Interactive menu
+        # Interactive menu (plain print — before Rich Live starts)
         mode, trader = select_mode_interactive(config)
 
-    bot = PolymarketBot(config, trader)
+    bot = PolymarketBot(config, trader, mode=mode)
 
     try:
         asyncio.run(bot.run())
