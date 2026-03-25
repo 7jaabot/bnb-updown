@@ -200,6 +200,7 @@ class LiveTrader:
         self._trades: list[LiveTrade] = []
         self._pending_trades: list[LiveTrade] = []
         self._trade_counter = 0
+        self._pancake_client = None  # Set externally by PolymarketBot
 
         # Load .env and init
         self._load_env()
@@ -516,10 +517,69 @@ class LiveTrader:
 
         return trade
 
+    def _fetch_round_pnl(self, trade, bnb_price: float) -> tuple[float, float]:
+        """
+        Fetch on-chain round data for a completed epoch and compute real PnL.
+
+        PancakeSwap Prediction V2 payout mechanics:
+          - rewardBaseCalAmount = total BNB bet on the winning side
+          - rewardAmount        = total payout pool (totalAmount * (1 - fee))
+          - payout for a winner = bet_bnb * rewardAmount / rewardBaseCalAmount
+          - pnl_bnb = payout - bet_bnb  (positive if won, negative if lost)
+          - pnl_usdc = pnl_bnb * bnb_price
+
+        Returns (pnl_usdc, payout_per_bnb) where payout_per_bnb is the multiplier
+        applied to each BNB wagered (>1 = profit, 0 = loss).
+        """
+        if self._pancake_client is None:
+            logger.warning("No PancakeClient available — cannot compute on-chain PnL")
+            return None, None
+
+        try:
+            round_data = self._pancake_client.get_round_by_epoch(trade.epoch)
+        except Exception as e:
+            logger.warning(f"Could not fetch on-chain round data for epoch {trade.epoch}: {e}")
+            return None, None
+
+        if round_data is None:
+            logger.warning(f"No round data returned for epoch {trade.epoch}")
+            return None, None
+
+        reward_base = round_data.reward_base_cal_amount
+        reward_pool = round_data.reward_amount
+        bet_bnb = trade.bet_bnb
+
+        if reward_base <= 0 or reward_pool <= 0:
+            # Round not yet settled on-chain — reward fields are zero
+            logger.warning(
+                f"Epoch {trade.epoch}: reward fields not yet populated on-chain "
+                f"(rewardBaseCalAmount={reward_base}, rewardAmount={reward_pool}). "
+                f"Will retry at next resolution cycle."
+            )
+            return None, None
+
+        # Real payout the contract will send when claim() is called
+        payout_bnb = bet_bnb * reward_pool / reward_base
+        pnl_bnb = payout_bnb - bet_bnb
+        pnl_usdc = round(pnl_bnb * bnb_price, 4)
+        payout_per_bnb = payout_bnb / bet_bnb if bet_bnb > 0 else 0.0
+
+        logger.info(
+            f"📡 On-chain PnL for epoch {trade.epoch}: "
+            f"bet={bet_bnb:.6f} BNB | "
+            f"rewardBase={reward_base:.6f} | rewardPool={reward_pool:.6f} | "
+            f"payout={payout_bnb:.6f} BNB | "
+            f"pnl_bnb={pnl_bnb:+.6f} | pnl_usdc=${pnl_usdc:+.4f}"
+        )
+        return pnl_usdc, payout_per_bnb
+
     def resolve_trades(self, window_index: int, bnb_open: float, bnb_close: float):
         """
         Resolve pending trades for a completed window.
         Also triggers claim for winning trades if auto_claim is enabled.
+
+        PnL is calculated from on-chain round data (rewardAmount / rewardBaseCalAmount)
+        to reflect the actual payout received from the contract, not a theoretical estimate.
 
         Args:
             window_index: The window that just completed.
@@ -529,6 +589,8 @@ class LiveTrader:
         resolved = []
         still_pending = []
         bnb_went_up = bnb_close > bnb_open
+        # Use mid-point BNB price for USDC conversion (most accurate snapshot at resolution)
+        bnb_price_at_close = bnb_close if bnb_close > 0 else bnb_open
 
         for trade in self._pending_trades:
             if trade.window_index != window_index:
@@ -545,15 +607,25 @@ class LiveTrader:
             trade.timestamp_exit = time.time()
 
             if won:
-                # Approximate payout: position_size / entry_price
-                shares = trade.position_size_usdc / trade.entry_price
-                payout = shares * 1.0
-                trade.pnl_usdc = round(payout - trade.position_size_usdc, 4)
-                trade.payout_per_share = 1.0
+                # Fetch real payout from on-chain round data
+                pnl_usdc, payout_per_bnb = self._fetch_round_pnl(trade, bnb_price_at_close)
+
+                if pnl_usdc is None:
+                    # On-chain data not yet settled — keep trade pending and retry later
+                    logger.warning(
+                        f"⏳ Trade {trade.trade_id} epoch {trade.epoch}: "
+                        f"on-chain reward not settled yet. Keeping PENDING."
+                    )
+                    still_pending.append(trade)
+                    continue
+
+                trade.pnl_usdc = pnl_usdc
+                trade.payout_per_share = round(payout_per_bnb, 6) if payout_per_bnb else 0.0
                 trade.outcome = "WIN"
                 self.metrics.wins += 1
             else:
-                trade.pnl_usdc = -trade.position_size_usdc
+                # Loss: actual cost = bet_bnb * bnb_price (plus gas, negligible)
+                trade.pnl_usdc = round(-trade.bet_bnb * bnb_price_at_close, 4)
                 trade.payout_per_share = 0.0
                 trade.outcome = "LOSS"
                 self.metrics.losses += 1
@@ -566,7 +638,8 @@ class LiveTrader:
             logger.info(
                 f"{result_emoji} Live trade resolved: {trade.trade_id} | "
                 f"{trade.side} | BNB {bnb_open:.2f}→{bnb_close:.2f} | "
-                f"PnL: ${trade.pnl_usdc:+.2f} | tx={trade.tx_hash}"
+                f"bet={trade.bet_bnb:.6f} BNB | PnL: ${trade.pnl_usdc:+.4f} | "
+                f"tx={trade.tx_hash}"
             )
 
             resolved.append(trade)

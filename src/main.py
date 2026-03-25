@@ -247,6 +247,10 @@ class PolymarketBot:
         )
         self.strategy = Strategy(config)
 
+        # Share PancakeClient with live trader for on-chain PnL resolution
+        if mode == "live" and hasattr(trader, '_pancake_client'):
+            trader._pancake_client = self.pancake
+
         # Dashboard — imported here so Rich is only required when running the bot
         from dashboard import Dashboard
         self.dashboard = Dashboard(trader=trader, binance=self.binance, mode=mode)
