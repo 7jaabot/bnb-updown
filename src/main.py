@@ -553,19 +553,16 @@ class PolymarketBot:
                 closed_round = None
 
             if closed_round is not None:
-                # Use prices from that epoch's start_ts to close_ts
-                epoch_prices = self.binance.get_window_prices(
-                    closed_round.start_ts,
-                    closed_round.close_ts,
-                )
-                if epoch_prices:
-                    bnb_open = epoch_prices[0].price
-                    bnb_close = epoch_prices[-1].price
+                # Use Chainlink oracle prices from the contract (same as PancakeSwap settlement)
+                bnb_open = closed_round.lock_price
+                bnb_close = closed_round.close_price
+
+                if bnb_open is not None and bnb_close is not None and closed_round.oracle_called:
                     direction = "UP" if bnb_close > bnb_open else "DOWN"
                     pct_change = abs(bnb_close / bnb_open - 1)
                     self.logger.info(
-                        f"🔚 Epoch #{resolve_epoch} closed: "
-                        f"BNB {bnb_open:.2f} → {bnb_close:.2f} "
+                        f"🔚 Epoch #{resolve_epoch} closed (Chainlink): "
+                        f"BNB {bnb_open:.4f} → {bnb_close:.4f} "
                         f"({direction} {pct_change:.3%})"
                     )
                     self.dashboard.log(
@@ -573,30 +570,13 @@ class PolymarketBot:
                     )
                     self.trader.resolve_trades(resolve_epoch, bnb_open, bnb_close)
                 else:
-                    # Fallback: use prices from a window ending at close_ts
-                    fallback_start = closed_round.start_ts
-                    fallback_prices = self.binance.get_window_prices(fallback_start)
-                    if fallback_prices:
-                        bnb_open = fallback_prices[0].price
-                        bnb_close = fallback_prices[-1].price
-                        direction = "UP" if bnb_close > bnb_open else "DOWN"
-                        pct_change = abs(bnb_close / bnb_open - 1)
-                        self.logger.info(
-                            f"🔚 Epoch #{resolve_epoch} closed (fallback prices): "
-                            f"BNB {bnb_open:.2f} → {bnb_close:.2f} "
-                            f"({direction} {pct_change:.3%})"
-                        )
-                        self.dashboard.log(
-                            f"🔚 Round #{resolve_epoch} result (approx): BNB {direction} {pct_change:.2%}"
-                        )
-                        self.trader.resolve_trades(resolve_epoch, bnb_open, bnb_close)
-                    else:
-                        self.logger.warning(
-                            f"No price data for epoch #{resolve_epoch} — cannot resolve trades."
-                        )
-                        self.dashboard.log(
-                            f"⚠️ Epoch #{resolve_epoch}: no price data — cannot resolve"
-                        )
+                    self.logger.warning(
+                        f"Epoch #{resolve_epoch}: oracle not yet called or prices missing "
+                        f"(lock={bnb_open}, close={bnb_close}, oracle={closed_round.oracle_called})"
+                    )
+                    self.dashboard.log(
+                        f"⚠️ Epoch #{resolve_epoch}: oracle not settled — will retry"
+                    )
             else:
                 self.logger.warning(
                     f"Could not fetch closed round data for epoch #{resolve_epoch} — skipping resolution."
