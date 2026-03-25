@@ -50,6 +50,7 @@ class PancakeRound:
     lock_price: Optional[float]   # BNB/USD at lock (Chainlink)
     oracle_called: bool
     is_mock: bool = False
+    close_price: Optional[float] = None  # BNB/USD at close (Chainlink, slot 5)
     # On-chain reward tracking (populated after round closes)
     reward_base_cal_amount: float = 0.0  # rewardBaseCalAmount (slot 11) — total winning bets
     reward_amount: float = 0.0           # rewardAmount (slot 12) — total payout pool (after fee)
@@ -133,6 +134,7 @@ def _decode_round_raw(raw: bytes, epoch: int) -> PancakeRound:
     lock_p_raw  = slot_int256(4)
     close_p_raw = slot_int256(5)
     lock_price  = lock_p_raw  / 1e8 if lock_p_raw  != 0 else None
+    close_price = close_p_raw / 1e8 if close_p_raw != 0 else None
     oracle_called = bool(slot(13) & 0xFF)
 
     return PancakeRound(
@@ -143,6 +145,7 @@ def _decode_round_raw(raw: bytes, epoch: int) -> PancakeRound:
         bull_payout=bull_payout, bear_payout=bear_payout,
         lock_price=lock_price, oracle_called=oracle_called,
         is_mock=False,
+        close_price=close_price,
         reward_base_cal_amount=reward_base_cal_amount,
         reward_amount=reward_amount,
     )

@@ -517,6 +517,171 @@ class LiveTrader:
 
         return trade
 
+    def _fix_legacy_pnl(self):
+        """
+        One-time migration: recalculate PnL for WIN trades that used the old
+        buggy formula (payout_per_share == 1.0 is the marker of the old code).
+        """
+        if self._pancake_client is None:
+            return
+
+        fixed = 0
+        for trade in self._trades:
+            if trade.outcome == "WIN" and trade.payout_per_share == 1.0:
+                pnl_usdc, payout_per_bnb = self._fetch_round_pnl(trade, trade.bnb_price_at_entry)
+                if pnl_usdc is not None:
+                    old_pnl = trade.pnl_usdc
+                    trade.pnl_usdc = pnl_usdc
+                    trade.payout_per_share = round(payout_per_bnb, 6) if payout_per_bnb else 0.0
+                    logger.info(
+                        f"🔧 Fixed legacy PnL for {trade.trade_id}: "
+                        f"${old_pnl:+.2f} → ${pnl_usdc:+.4f}"
+                    )
+                    fixed += 1
+
+        if fixed > 0:
+            self._recompute_metrics()
+            self._save_trades()
+            logger.info(f"🔧 Fixed {fixed} legacy PnL calculation(s). {self.metrics.summary()}")
+
+    def resolve_pending_on_startup(self):
+        """
+        Called at startup (after _pancake_client is injected by main.py) to resolve
+        any trades that were left PENDING from a previous session.
+
+        For each PENDING trade:
+          - Fetches on-chain round data via get_round_by_epoch(trade.epoch)
+          - If oracle not yet called → keep PENDING
+          - Determines win/loss by comparing close_price vs lock_price
+          - Computes PnL: winners use on-chain reward pool; losers use bet size at entry price
+          - Updates metrics and persists
+
+        After resolving, scans ALL trades for WIN trades without a claim_tx_hash
+        and auto-claims any that are claimable on-chain.
+        """
+        if self._pancake_client is None:
+            logger.warning("resolve_pending_on_startup: no PancakeClient injected — skipping.")
+            return
+
+        if not self._pending_trades:
+            logger.info("resolve_pending_on_startup: no PENDING trades to resolve.")
+        else:
+            logger.info(
+                f"resolve_pending_on_startup: resolving {len(self._pending_trades)} PENDING trade(s)..."
+            )
+
+        still_pending = []
+        resolved_count = 0
+
+        for trade in list(self._pending_trades):
+            try:
+                round_data = self._pancake_client.get_round_by_epoch(trade.epoch)
+            except Exception as e:
+                logger.warning(
+                    f"resolve_pending_on_startup: could not fetch epoch {trade.epoch}: {e} — keeping PENDING"
+                )
+                still_pending.append(trade)
+                continue
+
+            if round_data is None:
+                logger.warning(
+                    f"resolve_pending_on_startup: no round data for epoch {trade.epoch} — keeping PENDING"
+                )
+                still_pending.append(trade)
+                continue
+
+            if not round_data.oracle_called:
+                logger.info(
+                    f"resolve_pending_on_startup: epoch {trade.epoch} not yet settled "
+                    f"(oracleCalled=false) — keeping PENDING"
+                )
+                still_pending.append(trade)
+                continue
+
+            lock_price = round_data.lock_price
+            close_price = round_data.close_price
+
+            if lock_price is None or close_price is None:
+                logger.warning(
+                    f"resolve_pending_on_startup: epoch {trade.epoch} missing price data "
+                    f"(lock={lock_price}, close={close_price}) — keeping PENDING"
+                )
+                still_pending.append(trade)
+                continue
+
+            # Determine win/loss
+            if trade.side == "YES":   # bull: wins if price went up
+                won = close_price > lock_price
+            else:                      # bear ("NO"): wins if price went down
+                won = close_price < lock_price
+
+            trade.bnb_open = lock_price
+            trade.bnb_close = close_price
+            trade.timestamp_exit = time.time()
+
+            if won:
+                # Try to compute real PnL from on-chain reward pool
+                pnl_usdc, payout_per_bnb = self._fetch_round_pnl(trade, trade.bnb_price_at_entry)
+
+                if pnl_usdc is None:
+                    # Reward pool not populated yet (edge case) — keep PENDING
+                    logger.warning(
+                        f"resolve_pending_on_startup: epoch {trade.epoch} WIN but reward "
+                        f"pool not settled — keeping PENDING"
+                    )
+                    still_pending.append(trade)
+                    continue
+
+                trade.pnl_usdc = pnl_usdc
+                trade.payout_per_share = round(payout_per_bnb, 6) if payout_per_bnb else 0.0
+                trade.outcome = "WIN"
+                self.metrics.wins += 1
+            else:
+                # Loss — use entry price as BNB price approximation
+                trade.pnl_usdc = round(-trade.bet_bnb * trade.bnb_price_at_entry, 4)
+                trade.payout_per_share = 0.0
+                trade.outcome = "LOSS"
+                self.metrics.losses += 1
+
+            self.metrics.pending -= 1
+            self.metrics.total_pnl = round(self.metrics.total_pnl + trade.pnl_usdc, 4)
+            self.metrics.daily_pnl = round(self.metrics.daily_pnl + trade.pnl_usdc, 4)
+
+            result_emoji = "✅" if won else "❌"
+            logger.info(
+                f"{result_emoji} Startup resolved: {trade.trade_id} | "
+                f"{trade.side} | epoch={trade.epoch} | "
+                f"lock={lock_price:.2f} close={close_price:.2f} | "
+                f"PnL: ${trade.pnl_usdc:+.4f}"
+            )
+            resolved_count += 1
+
+        self._pending_trades = still_pending
+
+        if resolved_count > 0:
+            edges = [t.edge_at_entry for t in self._trades]
+            self.metrics.avg_edge = sum(edges) / len(edges) if edges else 0.0
+            self._save_trades()
+            logger.info(
+                f"resolve_pending_on_startup: resolved {resolved_count} trade(s). "
+                f"{self.metrics.summary()}"
+            )
+
+        # ── Auto-claim any WIN trades without a claim_tx_hash ──────────────────
+        if self.auto_claim:
+            unclaimed_win_epochs = [
+                t.epoch
+                for t in self._trades
+                if t.outcome == "WIN" and not t.claim_tx_hash
+            ]
+            if unclaimed_win_epochs:
+                logger.info(
+                    f"resolve_pending_on_startup: checking {len(unclaimed_win_epochs)} unclaimed WIN epoch(s)..."
+                )
+                self.claim_winnings(unclaimed_win_epochs)
+            else:
+                logger.info("resolve_pending_on_startup: no unclaimed WIN epochs found.")
+
     def _fetch_round_pnl(self, trade, bnb_price: float) -> tuple[float, float]:
         """
         Fetch on-chain round data for a completed epoch and compute real PnL.

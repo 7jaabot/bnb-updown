@@ -250,6 +250,10 @@ class PolymarketBot:
         # Share PancakeClient with live trader for on-chain PnL resolution
         if mode == "live" and hasattr(trader, '_pancake_client'):
             trader._pancake_client = self.pancake
+            # Fix any trades with buggy PnL from old formula
+            trader._fix_legacy_pnl()
+            # Resolve any PENDING trades from previous sessions and auto-claim wins
+            trader.resolve_pending_on_startup()
 
         # Dashboard — imported here so Rich is only required when running the bot
         from dashboard import Dashboard
