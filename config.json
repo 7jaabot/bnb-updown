@@ -33,7 +33,6 @@
   "live_trading": {
     "enabled": false,
     "log_file": "data/live_trades.json",
-    "max_daily_loss_usdc": 100.0,
     "gas_price_buffer_pct": 0.10,
     "auto_claim": true
   },

@@ -208,7 +208,6 @@ def _init_live_mode(config: dict) -> tuple[str, object]:
     bnb_balance = trader.get_bnb_balance()
     print(f"\n💰 Wallet: {trader._wallet_address}")
     print(f"💰 BNB Balance: {bnb_balance:.6f} BNB")
-    print(f"⚠️  Max daily loss: ${trader.max_daily_loss_usdc:.2f}")
     print(f"⚠️  Auto-claim: {'enabled' if trader.auto_claim else 'disabled'}")
 
     print("\n🚀 Live trading starting...\n")
@@ -269,6 +268,7 @@ class PolymarketBot:
         self._poll_interval = config.get("polymarket", {}).get("poll_interval_seconds", 5)
         self._min_seconds_before_lock = config.get("strategy", {}).get("min_seconds_before_lock", 15)
         self._live_ref = None  # Rich Live instance (set during run())
+        self._live_close_ts: float | None = None  # close_ts of the live round (N-1)
 
     def _refresh_display(self):
         """Push a fresh render to the Live display if it's active."""
@@ -356,6 +356,18 @@ class PolymarketBot:
         # Update dashboard window info
         self.dashboard.update_window(window)
 
+        # Update round card with current round/signal data
+        self.dashboard.update_round_info(
+            epoch=current_epoch,
+            lock_price=getattr(round_data, 'lock_price', None),
+            pool_total_bnb=getattr(round_data, 'total_bnb', None),
+            p_up=None,  # will be set after p_up_display is computed below
+            edge=None,  # will be set if signal fires
+            signal_side=None if not self._traded_this_epoch else self.dashboard._round_signal_side,
+            bet_bnb=None if not self._traded_this_epoch else self.dashboard._round_bet_bnb,
+            bet_usdc=None if not self._traded_this_epoch else self.dashboard._round_bet_usdc,
+        )
+
         # Periodic status log (every 30s) — file only, dashboard shows live
         if int(now) % 30 == 0:
             bnb = self.binance.last_price
@@ -416,6 +428,18 @@ class PolymarketBot:
             seconds_remaining=seconds_to_lock,
         ) if len(prices) >= 5 else None
 
+        # Update round card p_up
+        self.dashboard.update_round_info(
+            epoch=current_epoch,
+            lock_price=getattr(round_data, 'lock_price', None),
+            pool_total_bnb=getattr(round_data, 'total_bnb', None),
+            p_up=p_up_display,
+            edge=self.dashboard._round_edge,
+            signal_side=self.dashboard._round_signal_side,
+            bet_bnb=self.dashboard._round_bet_bnb,
+            bet_usdc=self.dashboard._round_bet_usdc,
+        )
+
         # Log evaluation to dashboard
         p_up_str = f"{p_up_display:.2f}" if p_up_display is not None else "?"
         self.dashboard.log(
@@ -454,8 +478,20 @@ class PolymarketBot:
                 self._refresh_display()
 
                 # Enter trade (one trade per epoch max)
-                self.trader.enter_trade(signal, window)
+                trade_result = self.trader.enter_trade(signal, window)
                 self._traded_this_epoch = True
+
+                # Update round card with bet info
+                self.dashboard.update_round_info(
+                    epoch=current_epoch,
+                    lock_price=getattr(round_data, 'lock_price', None),
+                    pool_total_bnb=getattr(round_data, 'total_bnb', None),
+                    p_up=p_up_display,
+                    edge=signal.edge,
+                    signal_side=signal.side,
+                    bet_bnb=getattr(trade_result, 'bet_bnb', None) if trade_result else signal.position_size_usdc / (self.binance.last_price or 600),
+                    bet_usdc=signal.position_size_usdc,
+                )
 
                 self.dashboard.update_status(f"✅ Trade entered: {signal.side}")
                 self.dashboard.log(
@@ -549,10 +585,64 @@ class PolymarketBot:
                     f"⚠️ Epoch #{resolve_epoch}: round data unavailable — cannot resolve"
                 )
 
+        # ── Update LIVE round card (epoch N-1 just locked) ──
+        live_epoch = self._last_epoch  # the epoch that just locked becomes the live round
+        if live_epoch > 0:
+            try:
+                live_round = self.pancake.get_round_by_epoch(live_epoch)
+            except Exception as e:
+                self.logger.warning(f"Could not fetch live round data for epoch {live_epoch}: {e}")
+                live_round = None
+
+            live_lock_price = None
+            live_close_ts = None
+            if live_round is not None:
+                live_lock_price = live_round.lock_price
+                live_close_ts = float(live_round.close_ts)
+                self._live_close_ts = live_close_ts
+
+            # Check if we have a pending/recent trade for this epoch
+            live_signal_side = None
+            live_bet_bnb = None
+            live_bet_usdc = None
+            live_edge = None
+
+            # Look in all trades (pending + resolved) for this epoch
+            all_trades = list(getattr(self.trader, '_trades', []))
+            for t in reversed(all_trades):
+                if getattr(t, 'epoch', None) == live_epoch:
+                    live_signal_side = getattr(t, 'side', None)
+                    live_bet_bnb = getattr(t, 'bet_bnb', None)
+                    live_bet_usdc = getattr(t, 'position_size_usdc', None)
+                    live_edge = getattr(t, 'edge_at_entry', None)
+                    break
+
+            self.dashboard.update_live_round(
+                epoch=live_epoch,
+                lock_price=live_lock_price,
+                close_ts=live_close_ts,
+                signal_side=live_signal_side,
+                bet_bnb=live_bet_bnb,
+                bet_usdc=live_bet_usdc,
+                edge=live_edge,
+            )
+
         # Advance to new epoch
         self._last_epoch = new_epoch
         self._traded_this_epoch = False
         self._in_entry_window = False
+
+        # Reset NEXT round card for the new epoch
+        self.dashboard.update_round_info(
+            epoch=new_epoch,
+            lock_price=getattr(round_data, 'lock_price', None),
+            pool_total_bnb=getattr(round_data, 'total_bnb', None),
+            p_up=None,
+            edge=None,
+            signal_side=None,
+            bet_bnb=None,
+            bet_usdc=None,
+        )
 
         bnb = self.binance.last_price
         self._last_bnb_window_open = bnb

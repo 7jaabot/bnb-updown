@@ -183,7 +183,6 @@ class LiveTrader:
         cfg_pancake = config.get("pancake", {})
 
         self.log_file = cfg_live.get("log_file", "data/live_trades.json")
-        self.max_daily_loss_usdc = cfg_live.get("max_daily_loss_usdc", 100.0)
         self.gas_price_buffer_pct = cfg_live.get("gas_price_buffer_pct", 0.10)
         self.auto_claim = cfg_live.get("auto_claim", True)
 
@@ -315,24 +314,6 @@ class LiveTrader:
 
         Returns True if safe to trade, False otherwise.
         """
-        # Daily loss limit
-        if self.metrics.daily_pnl <= -self.max_daily_loss_usdc:
-            logger.warning(
-                f"🛑 Daily loss limit reached: ${self.metrics.daily_pnl:.2f} "
-                f"(limit: -${self.max_daily_loss_usdc:.2f}). Skipping trade."
-            )
-            return False
-
-        # Check if this trade would breach the limit
-        projected_daily = self.metrics.daily_pnl - position_size_usdc
-        if projected_daily <= -self.max_daily_loss_usdc:
-            logger.warning(
-                f"🛑 Trade would breach daily loss limit. "
-                f"Daily PnL: ${self.metrics.daily_pnl:.2f}, "
-                f"trade size: ${position_size_usdc:.2f}. Skipping."
-            )
-            return False
-
         # BNB balance check
         bet_bnb = position_size_usdc / bnb_price
         gas_reserve_bnb = 0.005  # ~0.005 BNB for gas
@@ -993,7 +974,7 @@ class LiveTrader:
         print(f"  Wallet:      {self._wallet_address}")
         print(f"  Balance:     {bnb_balance}")
         print(f"  Total PnL:   ${self.metrics.total_pnl:+.2f}")
-        print(f"  Daily PnL:   ${self.metrics.daily_pnl:+.2f} (limit: -${self.max_daily_loss_usdc:.0f})")
+        print(f"  Daily PnL:   ${self.metrics.daily_pnl:+.2f}")
         print(f"  Total trades: {self.metrics.total_trades}")
         print(f"  Win rate:    {self.metrics.win_rate:.1%}")
         print(f"  Wins:        {self.metrics.wins}")
