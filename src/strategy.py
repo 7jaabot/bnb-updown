@@ -165,25 +165,32 @@ def compute_volatility(prices: list[float]) -> float:
 def estimate_p_up_momentum(
     prices: list[float],
     window_seconds: float = 300.0,
-    seconds_remaining: float = 60.0,
+    seconds_remaining: float = 60.0,   # DEPRECATED — kept for compat, no longer used
+    seconds_to_lock: float = 30.0,     # NEW: seconds until lock_ts (end of bet phase)
+    round_duration: float = 300.0,     # NEW: duration of live round post-lock (seconds)
     n_simulations: int = 500,
 ) -> float:
     """
-    Estimate P(BNB price at window end > BNB price at window start).
+    Estimate P(close_price > lock_price) for the current PancakeSwap round.
 
-    Method: Geometric Brownian Motion (GBM) Monte Carlo projection.
+    PancakeSwap settles UP if close_price > lock_price, where:
+      - lock_price  = oracle price at the moment betting closes (lock_ts)
+      - close_price = oracle price at the end of the live round (close_ts)
 
-    Uses the observed drift (momentum) and volatility over the current window
-    to simulate the remaining price path.
+    Method: Geometric Brownian Motion (GBM) Monte Carlo.
+    We simulate a single continuous path from NOW through lock_ts and on to
+    close_ts.  P(UP) = fraction of paths where close_price > lock_price.
 
     Args:
-        prices: Price series for the current window.
-        window_seconds: Total window duration in seconds.
-        seconds_remaining: Seconds until window end.
+        prices: Price series observed since the start of the current epoch.
+        window_seconds: Total betting window duration (unused, kept for compat).
+        seconds_remaining: DEPRECATED — superseded by seconds_to_lock.
+        seconds_to_lock: Seconds from now until lock_ts (betting deadline).
+        round_duration: Duration of the live round after lock_ts (default 300s).
         n_simulations: Number of Monte Carlo paths.
 
     Returns:
-        Probability that BNB ends the window above its opening price.
+        P(close > lock), clamped to [0.35, 0.65].
         Returns 0.5 if insufficient data.
     """
     if len(prices) < 5:
@@ -195,12 +202,11 @@ def estimate_p_up_momentum(
     if len(log_returns) == 0:
         return 0.5
 
-    mu = float(np.mean(log_returns))       # Per-observation drift
-    sigma = float(np.std(log_returns))     # Per-observation vol
+    mu = float(np.mean(log_returns))    # Per-second drift (1 obs ≈ 1s)
+    sigma = float(np.std(log_returns))  # Per-second vol
 
     if sigma == 0:
-        # No volatility observed → not enough info for a strong signal
-        # Slight bias toward current direction, but never certainty
+        # No volatility: slight directional bias, never certainty
         if prices[-1] > prices[0]:
             return 0.6
         elif prices[-1] < prices[0]:
@@ -209,29 +215,36 @@ def estimate_p_up_momentum(
             return 0.5
 
     current_price = prices[-1]
-    opening_price = prices[0]
 
-    # Number of remaining "steps" — approximate 1 step per second
-    dt = 1.0  # 1 second per step
-    steps = max(1, int(seconds_remaining))
+    # Simulate a single continuous path: NOW → lock_ts → close_ts
+    # Each step = 1 second (dt = 1.0)
+    total_seconds = seconds_to_lock + round_duration
+    steps = max(2, int(total_seconds))  # at least 2 steps to have a lock and close
+    lock_step = max(1, int(seconds_to_lock))  # index of the lock price in the path
 
-    # Monte Carlo: simulate remaining price paths
-    rng = np.random.default_rng(seed=None)
+    rng = np.random.default_rng()
     z = rng.standard_normal((n_simulations, steps))
-    log_path = (mu - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * z
-    cumulative_log_returns = np.sum(log_path, axis=1)
-    final_prices = current_price * np.exp(cumulative_log_returns)
+    # Per-second log-increment: (mu - 0.5*sigma^2)*dt + sigma*sqrt(dt)*z, dt=1
+    log_increments = (mu - 0.5 * sigma**2) + sigma * z
+    cumulative = np.cumsum(log_increments, axis=1)
 
-    # P(Up) = fraction of paths where final price > opening price
-    p_up_raw = float(np.mean(final_prices > opening_price))
+    # Price at lock_ts = current_price * exp(cumulative at step lock_step)
+    lock_prices = current_price * np.exp(cumulative[:, lock_step - 1])
 
-    # Clamp to [0.35, 0.65] — force humility, avoid near-certain bets on 5mn crypto.
-    # Narrower range means weak momentum ≈ 0.50 (no trade), strong momentum ≈ 0.65 (trade).
+    # Price at close_ts = current_price * exp(cumulative at final step)
+    close_prices = current_price * np.exp(cumulative[:, -1])
+
+    # P(UP) = P(close_price > lock_price)
+    p_up_raw = float(np.mean(close_prices > lock_prices))
+
+    # Clamp to [0.35, 0.65] — force humility on 5min crypto direction.
     p_up = max(0.35, min(0.65, p_up_raw))
 
     logger.debug(
         f"GBM estimate: μ={mu:.6f} σ={sigma:.6f} "
-        f"steps={steps} P(Up)={p_up:.3f} (raw={p_up_raw:.3f})"
+        f"seconds_to_lock={seconds_to_lock:.0f}s round_duration={round_duration:.0f}s "
+        f"steps={steps} lock_step={lock_step} "
+        f"P(close>lock)={p_up:.3f} (raw={p_up_raw:.3f})"
     )
     return p_up
 
@@ -406,11 +419,11 @@ class Strategy:
             logger.debug("Insufficient price data for strategy evaluation.")
             return None
 
-        # Estimate P(Up) via GBM Monte Carlo
+        # Estimate P(close > lock) via GBM Monte Carlo
         p_up = estimate_p_up_momentum(
             prices=prices,
-            window_seconds=300.0,
-            seconds_remaining=window.seconds_remaining,
+            seconds_to_lock=window.seconds_remaining,
+            round_duration=300.0,
         )
 
         # Pool quality filters (only when trading against real pool prices)

@@ -440,12 +440,12 @@ class PolymarketBot:
             + (" [MOCK]" if round_data.is_mock else "")
         )
 
-        # Compute P(Up) for dashboard display (before strategy filters)
+        # Compute P(close > lock) for dashboard display (before strategy filters)
         from strategy import estimate_p_up_momentum
         p_up_display = estimate_p_up_momentum(
             prices=prices,
-            window_seconds=300.0,
-            seconds_remaining=seconds_to_lock,
+            seconds_to_lock=seconds_to_lock,
+            round_duration=300.0,
         ) if len(prices) >= 5 else None
 
         # Update round card p_up
