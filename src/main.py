@@ -267,6 +267,7 @@ class PolymarketBot:
         self._last_poll_ts: float = 0.0  # when we last polled the contract
         self._in_entry_window: bool = False  # whether we're currently in entry window
         self._poll_interval = config.get("polymarket", {}).get("poll_interval_seconds", 5)
+        self._min_seconds_before_lock = config.get("strategy", {}).get("min_seconds_before_lock", 15)
         self._live_ref = None  # Rich Live instance (set during run())
 
     def _refresh_display(self):
@@ -436,6 +437,15 @@ class PolymarketBot:
 
         if signal:
             if not self._traded_this_epoch:
+                # Safety guard: don't bet if too close to lock (tx would fail)
+                if seconds_to_lock < self._min_seconds_before_lock:
+                    msg = f"⏱ Too close to lock ({seconds_to_lock:.1f}s < {self._min_seconds_before_lock}s min) — skipping"
+                    self.logger.warning(msg)
+                    self.dashboard.log(msg)
+                    self.dashboard.update_status("⏱ Too late to bet")
+                    self._refresh_display()
+                    return
+
                 # Log signal to dashboard
                 self.dashboard.log(
                     f"🎯 Signal: {signal.side} @ edge={signal.edge:.2f} | P(Up)={signal.p_up:.2f} | ${signal.position_size_usdc:.2f}"
