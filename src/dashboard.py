@@ -62,6 +62,9 @@ class Dashboard:
         self._cached_bnb_balance: Optional[float] = None
         self._last_balance_update: float = 0.0
 
+        # Chainlink BNB/USD price (same oracle as PancakeSwap, refreshed every ~10s)
+        self._chainlink_bnb_price: Optional[float] = None
+
         # ── NEXT round card data (epoch N, betting open) ──
         self._round_epoch: Optional[int] = None
         self._round_lock_price: Optional[float] = None
@@ -275,7 +278,8 @@ class Dashboard:
 
     def _make_live_round_card(self) -> Panel:
         """Build the LIVE round card (epoch N-1, already locked, waiting for close)."""
-        bnb_price = self.binance.last_price
+        # Use Chainlink price if available (same oracle as PancakeSwap) — fallback to Binance
+        bnb_price = self._chainlink_bnb_price if self._chainlink_bnb_price is not None else self.binance.last_price
         epoch = self._live_epoch
         lock_price = self._live_lock_price
         close_ts = self._live_close_ts
@@ -307,6 +311,8 @@ class Dashboard:
         )
 
         # ── BNB current price (colored relative to lock) ──
+        # Prefer Chainlink (same oracle as PancakeSwap) — label it accordingly
+        price_source = "CL" if self._chainlink_bnb_price is not None else "Binance"
         if bnb_price is not None:
             if lock_price is not None and bnb_price > lock_price:
                 price_color = "green"
@@ -314,7 +320,7 @@ class Dashboard:
                 price_color = "red"
             else:
                 price_color = "dim"
-            bnb_str = f"BNB: [{price_color}]${bnb_price:.2f}[/{price_color}]"
+            bnb_str = f"BNB [{price_source}]: [{price_color}]${bnb_price:.2f}[/{price_color}]"
         else:
             bnb_str = "BNB: [dim]N/A[/dim]"
 

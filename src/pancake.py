@@ -31,6 +31,7 @@ BSC_RPC_URLS = [
 
 # PancakeSwap Prediction V2 — BNB/USD (high volume)
 PANCAKE_BNB_CONTRACT = "0x18B2A687610328590Bc8F2e5fEdDe3b582A49cdA"
+CHAINLINK_BNB_USD = "0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE"  # Chainlink BNB/USD on BSC
 PANCAKE_FEE = 0.03
 
 
@@ -235,6 +236,36 @@ class PancakeClient:
         if self.use_mock_on_failure:
             return _mock_round()
         return None
+
+    def get_chainlink_bnb_price(self) -> Optional[float]:
+        """
+        Fetch the latest BNB/USD price from the Chainlink aggregator on BSC.
+
+        This is the same oracle PancakeSwap Prediction V2 uses to settle rounds.
+        Returns price as float (USD), or None on failure.
+
+        Calls latestRoundData() → returns (roundId, answer, startedAt, updatedAt, answeredInRound)
+        answer is int256 with 8 decimals.
+        """
+        if not self._connected or not self._w3:
+            return None
+        try:
+            addr = self._w3.to_checksum_address(CHAINLINK_BNB_USD)
+            # latestRoundData() selector
+            sel = self._w3.keccak(text="latestRoundData()")[:4]
+            raw = self._w3.eth.call({"to": addr, "data": sel})
+            # Returns 5 x uint256/int256 (160 bytes): roundId, answer, startedAt, updatedAt, answeredInRound
+            if len(raw) < 64:
+                return None
+            # answer is slot 1 (bytes 32-63), int256
+            answer_raw = int.from_bytes(raw[32:64], "big")
+            # Handle two's complement for int256
+            if answer_raw >= 2**255:
+                answer_raw -= 2**256
+            return answer_raw / 1e8
+        except Exception as e:
+            logger.debug(f"Chainlink BNB/USD read failed: {e}")
+            return None
 
     def _fetch_round_onchain(self) -> PancakeRound:
         """Fetch currentEpoch() then its round data."""

@@ -307,6 +307,18 @@ class PolymarketBot:
                     self.logger.debug(f"Balance refresh failed: {e}")
             await asyncio.sleep(30)
 
+    async def _update_chainlink_price(self):
+        """Periodically fetch BNB/USD price from Chainlink oracle on BSC (same as PancakeSwap)."""
+        while self._running:
+            try:
+                loop = asyncio.get_event_loop()
+                price = await loop.run_in_executor(None, self.pancake.get_chainlink_bnb_price)
+                if price is not None:
+                    self.dashboard._chainlink_bnb_price = price
+            except Exception as e:
+                self.logger.debug(f"Chainlink price refresh failed: {e}")
+            await asyncio.sleep(10)
+
     async def _tick(self):
         """
         One iteration of the main loop.
@@ -716,6 +728,7 @@ class PolymarketBot:
                 self.binance.run(),
                 self._run_main_loop(),
                 self._update_live_balance(),
+                self._update_chainlink_price(),
             )
         finally:
             live.stop()
