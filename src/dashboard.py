@@ -469,7 +469,7 @@ class Dashboard:
         )
         table.add_column("#", style="dim", width=4, justify="right")
         table.add_column("Time", width=7)
-        table.add_column("Side", width=6)
+        table.add_column("Side", width=7)
         table.add_column("Edge", width=6)
         table.add_column("PnL", width=9, justify="right")
 
@@ -482,8 +482,9 @@ class Dashboard:
             ts = datetime.fromtimestamp(trade.timestamp_entry).strftime("%H:%M")
 
             side = trade.side
+            side_label = "▲ UP" if side == "YES" else "▼ DOWN"
             side_color = "green" if side == "YES" else "red"
-            side_str = f"[{side_color}]{side}[/{side_color}]"
+            side_str = f"[{side_color}]{side_label}[/{side_color}]"
 
             edge_str = f"{trade.edge_at_entry:.2f}"
 
