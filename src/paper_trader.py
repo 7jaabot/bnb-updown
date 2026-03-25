@@ -4,6 +4,10 @@ paper_trader.py — Paper trading simulator
 Simulates trades without real money or API calls.
 Logs all simulated trades to data/paper_trades.json.
 Tracks PnL, win rate, and edge metrics.
+
+PnL is calculated using on-chain PancakeSwap round data (rewardAmount /
+rewardBaseCalAmount) — identical to LiveTrader — so paper results are
+directly comparable to live results.
 """
 
 import json
@@ -16,6 +20,8 @@ from typing import Optional
 from strategy import Signal, WindowInfo
 
 logger = logging.getLogger(__name__)
+
+PANCAKE_FEE = 0.03
 
 
 @dataclass
@@ -36,6 +42,11 @@ class Trade:
     window_end_ts: float
     window_index: int
     is_mock: bool                         # Based on mock data?
+
+    # On-chain fields (mirrors LiveTrade)
+    epoch: int = 0                        # PancakeSwap epoch number
+    bet_bnb: float = 0.0                  # BNB equivalent of the bet
+    bnb_price_at_entry: float = 0.0      # BNB/USD at entry time
 
     # Resolution fields (filled later)
     bnb_open: Optional[float] = None      # BNB price at window start
@@ -90,7 +101,8 @@ class PaperTrader:
     Paper trading engine.
 
     Accepts signals from the strategy and simulates trade execution.
-    Resolves trades after each window ends (comparing BNB open vs close).
+    Resolves trades after each window ends using on-chain PancakeSwap data
+    (same PnL calculation as LiveTrader).
     Persists all trades to a JSON log file.
     """
 
@@ -106,6 +118,10 @@ class PaperTrader:
         self._trades: list[Trade] = []
         self._pending_trades: list[Trade] = []
         self._trade_counter = 0
+
+        # Injected externally by main.py (same as LiveTrader)
+        self._pancake_client = None
+        self._binance_feed = None
 
         # Load existing trades from file
         self._load_trades()
@@ -123,7 +139,10 @@ class PaperTrader:
             logger.info(f"Loaded {len(trades_data)} existing trades from {self.log_file}")
 
             for t_dict in trades_data:
-                trade = Trade(**t_dict)
+                # Filter to only known Trade fields so old JSON with extra keys doesn't break
+                known_fields = Trade.__dataclass_fields__.keys()
+                filtered = {k: v for k, v in t_dict.items() if k in known_fields}
+                trade = Trade(**filtered)
                 self._trades.append(trade)
                 if trade.outcome == "PENDING" or trade.outcome is None:
                     self._pending_trades.append(trade)
@@ -202,9 +221,15 @@ class PaperTrader:
         self._trade_counter += 1
         trade_id = f"PT-{int(time.time())}-{self._trade_counter:04d}"
 
+        # Get current BNB price from the injected Binance feed
+        bnb_price = self._binance_feed.last_price if self._binance_feed else None
+        if not bnb_price or bnb_price <= 0:
+            logger.warning("BNB price unavailable — bet_bnb will be 0.0 for this trade.")
+            bnb_price = 0.0
+
+        bet_bnb = signal.position_size_usdc / bnb_price if bnb_price > 0 else 0.0
+
         # Simulate latency impact on entry price (slight slippage).
-        # Entry is always based on signal.yes_price (0.50 when use_fair_odds=True),
-        # ensuring symmetric PnL (~$50 win / ~$50 loss for $50 staked).
         latency_slippage = (self.simulate_latency_ms / 1000.0) * 0.001  # tiny
         if signal.side == "YES":
             entry_price = min(0.99, signal.yes_price + latency_slippage)
@@ -228,6 +253,10 @@ class PaperTrader:
             window_end_ts=window.window_end_ts,
             window_index=window.window_index,
             is_mock=signal.is_mock,
+            # On-chain fields
+            epoch=window.window_index,
+            bet_bnb=round(bet_bnb, 8),
+            bnb_price_at_entry=bnb_price,
             outcome="PENDING",
         )
 
@@ -244,20 +273,195 @@ class PaperTrader:
 
         mock_tag = " [MOCK]" if trade.is_mock else ""
         logger.info(
-            f"📝 Trade entered{mock_tag}: {trade_id} | "
-            f"{trade.side} @ {trade.entry_price:.3f} | "
-            f"${trade.position_size_usdc:.2f} USDC | "
+            f"📝 Paper trade entered{mock_tag}: {trade_id} | "
+            f"{trade.side} @ epoch={trade.epoch} | "
+            f"{bet_bnb:.6f} BNB (${trade.position_size_usdc:.2f}) | "
             f"edge={trade.edge_at_entry:.3f}"
         )
 
         return trade
 
+    def _fetch_round_pnl(self, trade: Trade, bnb_price: float):
+        """
+        Fetch on-chain round data for a completed epoch and compute real PnL.
+
+        Mirrors LiveTrader._fetch_round_pnl() — reads PancakeSwap reward pool
+        to determine the actual payout multiplier.
+
+        PancakeSwap Prediction V2 payout mechanics:
+          - rewardBaseCalAmount = total BNB bet on the winning side
+          - rewardAmount        = total payout pool (totalAmount * (1 - fee))
+          - payout for a winner = bet_bnb * rewardAmount / rewardBaseCalAmount
+          - pnl_bnb = payout - bet_bnb
+          - pnl_usdc = pnl_bnb * bnb_price
+
+        Returns:
+            (pnl_usdc, payout_per_bnb) or (None, None) if data not yet available.
+        """
+        if self._pancake_client is None:
+            logger.debug(
+                f"No PancakeClient injected — cannot compute on-chain PnL for epoch {trade.epoch}."
+            )
+            return None, None
+
+        try:
+            round_data = self._pancake_client.get_round_by_epoch(trade.epoch)
+        except Exception as e:
+            logger.warning(f"Could not fetch on-chain round data for epoch {trade.epoch}: {e}")
+            return None, None
+
+        if round_data is None:
+            logger.warning(f"No round data returned for epoch {trade.epoch}")
+            return None, None
+
+        reward_base = round_data.reward_base_cal_amount
+        reward_pool = round_data.reward_amount
+        bet_bnb = trade.bet_bnb
+
+        if reward_base <= 0 or reward_pool <= 0:
+            logger.warning(
+                f"Epoch {trade.epoch}: reward fields not yet populated on-chain "
+                f"(rewardBaseCalAmount={reward_base}, rewardAmount={reward_pool}). "
+                f"Will retry at next resolution cycle."
+            )
+            return None, None
+
+        payout_bnb = bet_bnb * reward_pool / reward_base
+        pnl_bnb = payout_bnb - bet_bnb
+        pnl_usdc = round(pnl_bnb * bnb_price, 4)
+        payout_per_bnb = payout_bnb / bet_bnb if bet_bnb > 0 else 0.0
+
+        logger.info(
+            f"📡 On-chain PnL for epoch {trade.epoch}: "
+            f"bet={bet_bnb:.6f} BNB | "
+            f"rewardBase={reward_base:.6f} | rewardPool={reward_pool:.6f} | "
+            f"payout={payout_bnb:.6f} BNB | "
+            f"pnl_bnb={pnl_bnb:+.6f} | pnl_usdc=${pnl_usdc:+.4f}"
+        )
+        return pnl_usdc, payout_per_bnb
+
+    def resolve_pending_on_startup(self):
+        """
+        Called at startup (after _pancake_client is injected by main.py) to resolve
+        any trades that were left PENDING from a previous session.
+
+        Mirrors LiveTrader.resolve_pending_on_startup() — without the claim logic.
+        """
+        if self._pancake_client is None:
+            logger.info("resolve_pending_on_startup: no PancakeClient injected — skipping.")
+            return
+
+        if not self._pending_trades:
+            logger.info("resolve_pending_on_startup: no PENDING trades to resolve.")
+            return
+
+        logger.info(
+            f"resolve_pending_on_startup: resolving {len(self._pending_trades)} PENDING paper trade(s)..."
+        )
+
+        still_pending = []
+        resolved_count = 0
+
+        for trade in list(self._pending_trades):
+            try:
+                round_data = self._pancake_client.get_round_by_epoch(trade.epoch)
+            except Exception as e:
+                logger.warning(
+                    f"resolve_pending_on_startup: could not fetch epoch {trade.epoch}: {e} — keeping PENDING"
+                )
+                still_pending.append(trade)
+                continue
+
+            if round_data is None:
+                logger.warning(
+                    f"resolve_pending_on_startup: no round data for epoch {trade.epoch} — keeping PENDING"
+                )
+                still_pending.append(trade)
+                continue
+
+            if not round_data.oracle_called:
+                logger.info(
+                    f"resolve_pending_on_startup: epoch {trade.epoch} not yet settled "
+                    f"(oracleCalled=false) — keeping PENDING"
+                )
+                still_pending.append(trade)
+                continue
+
+            lock_price = round_data.lock_price
+            close_price = round_data.close_price
+
+            if lock_price is None or close_price is None:
+                logger.warning(
+                    f"resolve_pending_on_startup: epoch {trade.epoch} missing price data "
+                    f"(lock={lock_price}, close={close_price}) — keeping PENDING"
+                )
+                still_pending.append(trade)
+                continue
+
+            # Determine win/loss (same logic as live)
+            if trade.side == "YES":   # bull: wins if price went up
+                won = close_price > lock_price
+            else:                      # bear ("NO"): wins if price went down
+                won = close_price < lock_price
+
+            trade.bnb_open = lock_price
+            trade.bnb_close = close_price
+            trade.timestamp_exit = time.time()
+
+            if won:
+                pnl_usdc, payout_per_bnb = self._fetch_round_pnl(trade, trade.bnb_price_at_entry)
+
+                if pnl_usdc is None:
+                    logger.warning(
+                        f"resolve_pending_on_startup: epoch {trade.epoch} WIN but reward "
+                        f"pool not settled — keeping PENDING"
+                    )
+                    still_pending.append(trade)
+                    continue
+
+                trade.pnl_usdc = pnl_usdc
+                trade.payout_per_share = round(payout_per_bnb, 6) if payout_per_bnb else 0.0
+                trade.outcome = "WIN"
+                self.metrics.wins += 1
+            else:
+                trade.pnl_usdc = round(-trade.bet_bnb * trade.bnb_price_at_entry, 4)
+                trade.payout_per_share = 0.0
+                trade.outcome = "LOSS"
+                self.metrics.losses += 1
+
+            self.metrics.pending -= 1
+            self.metrics.total_pnl = round(self.metrics.total_pnl + trade.pnl_usdc, 4)
+
+            result_emoji = "✅" if won else "❌"
+            logger.info(
+                f"{result_emoji} Startup resolved: {trade.trade_id} | "
+                f"{trade.side} | epoch={trade.epoch} | "
+                f"lock={lock_price:.2f} close={close_price:.2f} | "
+                f"PnL: ${trade.pnl_usdc:+.4f}"
+            )
+            resolved_count += 1
+
+        self._pending_trades = still_pending
+
+        if resolved_count > 0:
+            # Recompute bankroll and avg_edge from scratch for accuracy
+            self._recompute_metrics()
+            self._save_trades()
+            logger.info(
+                f"resolve_pending_on_startup: resolved {resolved_count} paper trade(s). "
+                f"{self.metrics.summary()}"
+            )
+
     def resolve_trades(self, window_index: int, bnb_open: float, bnb_close: float):
         """
         Resolve all pending trades for a completed window.
 
+        PnL is calculated from on-chain PancakeSwap round data when available
+        (same as LiveTrader). Falls back to keeping PENDING if on-chain data
+        is not yet settled.
+
         Args:
-            window_index: The window that just completed.
+            window_index: The window (epoch) that just completed.
             bnb_open: BNB price at window start.
             bnb_close: BNB price at window end.
         """
@@ -265,16 +469,17 @@ class PaperTrader:
         still_pending = []
 
         bnb_went_up = bnb_close > bnb_open
+        bnb_price_at_close = bnb_close if bnb_close > 0 else bnb_open
 
         for trade in self._pending_trades:
             if trade.window_index != window_index:
                 still_pending.append(trade)
                 continue
 
-            # Determine outcome
+            # Determine outcome (YES=bull wins if price went up)
             if trade.side == "YES":
                 won = bnb_went_up
-            else:  # NO
+            else:  # NO = bear
                 won = not bnb_went_up
 
             trade.bnb_open = bnb_open
@@ -282,22 +487,32 @@ class PaperTrader:
             trade.timestamp_exit = time.time()
 
             if won:
-                # Payout: 1 USDC per share × shares bought
-                # Shares = position_size_usdc / entry_price
-                shares = trade.position_size_usdc / trade.entry_price
-                payout = shares * 1.0  # 1 USDC per winning share
-                trade.pnl_usdc = round(payout - trade.position_size_usdc, 4)
-                trade.payout_per_share = 1.0
+                # Use real on-chain payout data
+                pnl_usdc, payout_per_bnb = self._fetch_round_pnl(trade, bnb_price_at_close)
+
+                if pnl_usdc is None:
+                    # On-chain reward pool not yet settled — retry next epoch
+                    logger.warning(
+                        f"⏳ Paper trade {trade.trade_id} epoch {trade.epoch}: "
+                        f"on-chain reward not settled yet. Keeping PENDING."
+                    )
+                    still_pending.append(trade)
+                    continue
+
+                trade.pnl_usdc = pnl_usdc
+                trade.payout_per_share = round(payout_per_bnb, 6) if payout_per_bnb else 0.0
                 trade.outcome = "WIN"
                 self.metrics.wins += 1
-                # Return capital + profit
+                # Return committed capital + profit
                 self.metrics.bankroll += trade.position_size_usdc + trade.pnl_usdc
             else:
-                trade.pnl_usdc = -trade.position_size_usdc  # Lost entire stake
+                # Loss: cost = bet_bnb at current BNB price
+                trade.pnl_usdc = round(-trade.bet_bnb * bnb_price_at_close, 4)
                 trade.payout_per_share = 0.0
                 trade.outcome = "LOSS"
                 self.metrics.losses += 1
-                # Capital already deducted; add nothing back
+                # Stake already deducted at entry; adjust for BNB price drift
+                self.metrics.bankroll += trade.position_size_usdc + trade.pnl_usdc
 
             self.metrics.pending -= 1
             self.metrics.total_pnl = round(
@@ -308,16 +523,15 @@ class PaperTrader:
 
             result_emoji = "✅" if won else "❌"
             logger.info(
-                f"{result_emoji} Trade resolved: {trade.trade_id} | "
+                f"{result_emoji} Paper trade resolved: {trade.trade_id} | "
                 f"{trade.side} | BNB {bnb_open:.2f}→{bnb_close:.2f} | "
-                f"PnL: ${trade.pnl_usdc:+.2f} | "
+                f"bet={trade.bet_bnb:.6f} BNB | PnL: ${trade.pnl_usdc:+.4f} | "
                 f"Bankroll: ${self.metrics.bankroll:.2f}"
             )
 
         self._pending_trades = still_pending
 
         if resolved:
-            # Recompute avg_edge
             edges = [t.edge_at_entry for t in self._trades]
             self.metrics.avg_edge = sum(edges) / len(edges) if edges else 0.0
             self._save_trades()

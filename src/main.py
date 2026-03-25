@@ -246,12 +246,20 @@ class PolymarketBot:
         )
         self.strategy = Strategy(config)
 
-        # Share PancakeClient with live trader for on-chain PnL resolution
-        if mode == "live" and hasattr(trader, '_pancake_client'):
+        # Share PancakeClient with trader for on-chain PnL resolution (live + paper)
+        if hasattr(trader, '_pancake_client'):
             trader._pancake_client = self.pancake
-            # Fix any trades with buggy PnL from old formula
+
+        # Share Binance feed with paper trader so it can read current BNB price
+        if hasattr(trader, '_binance_feed'):
+            trader._binance_feed = self.binance
+
+        if mode == "live" and hasattr(trader, '_fix_legacy_pnl'):
+            # Fix any trades with buggy PnL from old formula (live only)
             trader._fix_legacy_pnl()
-            # Resolve any PENDING trades from previous sessions and auto-claim wins
+
+        # Resolve any PENDING trades from previous sessions (both modes)
+        if hasattr(trader, 'resolve_pending_on_startup'):
             trader.resolve_pending_on_startup()
 
         # Dashboard — imported here so Rich is only required when running the bot
