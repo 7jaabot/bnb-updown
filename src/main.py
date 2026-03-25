@@ -36,7 +36,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from market_data import BinanceFeed, PricePoint
 from pancake import PancakeClient, PancakeRound
-from strategy import Strategy, WindowInfo, window_from_round
+from strategy import WindowInfo, window_from_round
+from strategies import STRATEGIES
 from paper_trader import PaperTrader
 
 
@@ -58,12 +59,12 @@ def _cleanup_old_logs(log_dir: str, max_days: int = 30):
                 pass
 
 
-def setup_logging(config: dict, dashboard_mode: bool = False):
+def setup_logging(config: dict, dashboard_mode: bool = False, strategy_key: str = ""):
     """Configure logging from config.
 
     When dashboard_mode=True, reduces console handler to WARNING level
     (dashboard is the primary display) but keeps file logging at full level.
-    Log files are written as data/logs/run-YYYY-MM-DD.log (one per day).
+    Log files are written as data/logs/<strategy>/run-YYYY-MM-DD.log (one per day per strategy).
     Files older than 30 days are deleted automatically.
     """
     import datetime
@@ -75,8 +76,11 @@ def setup_logging(config: dict, dashboard_mode: bool = False):
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
 
-    # Daily log file: data/logs/run-YYYY-MM-DD.log
-    log_dir = "data/logs"
+    # Daily log file: data/logs/<strategy>/run-YYYY-MM-DD.log
+    if strategy_key:
+        log_dir = os.path.join("data", "logs", strategy_key)
+    else:
+        log_dir = "data/logs"
     os.makedirs(log_dir, exist_ok=True)
     today = datetime.date.today().strftime("%Y-%m-%d")
     log_file = os.path.join(log_dir, f"run-{today}.log")
@@ -157,13 +161,46 @@ def reset_paper_trades(config: dict):
     logging.info(f"🧹 Fresh start: reset {log_file}")
 
 
-def select_mode_interactive(config: dict) -> tuple[str, object]:
+def select_strategy_interactive(config: dict):
+    """Display strategy selection menu and return a strategy instance."""
+    strategy_list = list(STRATEGIES.items())
+
+    print("\n" + "=" * 40)
+    print("  Select Strategy")
+    print("=" * 40)
+    for i, (key, cls) in enumerate(strategy_list, 1):
+        # Instantiate temporarily to get the name
+        try:
+            name = cls(config).name
+        except Exception:
+            name = key
+        print(f"  [{i}] {name}")
+    print("=" * 40)
+
+    while True:
+        choice = input("Select strategy: ").strip()
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(strategy_list):
+                break
+        except ValueError:
+            pass
+        print(f"Invalid choice. Please enter 1-{len(strategy_list)}.")
+
+    key, cls = strategy_list[idx]
+    strategy = cls(config)
+    print(f"  → Strategy: {strategy.name}\n")
+    return strategy
+
+
+def select_mode_interactive(config: dict) -> tuple[str, object, object]:
     """
-    Display an interactive menu and return (mode, trader).
+    Display an interactive menu and return (mode, trader, strategy).
 
     Returns:
-        (mode, trader) where mode is "live" or "paper"
-        and trader is a LiveTrader or PaperTrader instance.
+        (mode, trader, strategy) where mode is "live" or "paper",
+        trader is a LiveTrader or PaperTrader instance,
+        and strategy is a BaseStrategy instance.
     """
     print("\n" + "=" * 40)
     print("  BNB Up/Down 5mn Trading Bot")
@@ -180,14 +217,17 @@ def select_mode_interactive(config: dict) -> tuple[str, object]:
         print("Invalid choice. Please enter 1, 2, or 3.")
 
     if choice == "1":
-        return _init_live_mode(config)
+        mode, trader = _init_live_mode(config)
     elif choice == "2":
         reset_paper_trades(config)
         trader = PaperTrader(config)
-        return "paper", trader
+        mode = "paper"
     else:
         trader = PaperTrader(config)
-        return "paper", trader
+        mode = "paper"
+
+    strategy = select_strategy_interactive(config)
+    return mode, trader, strategy
 
 
 def _init_live_mode(config: dict) -> tuple[str, object]:
@@ -230,7 +270,7 @@ class PolymarketBot:
     - Dashboard: Rich live terminal display
     """
 
-    def __init__(self, config: dict, trader, mode: str):
+    def __init__(self, config: dict, trader, mode: str, strategy=None):
         self.config = config
         self.logger = logging.getLogger("PolymarketBot")
         self.trader = trader
@@ -244,7 +284,11 @@ class PolymarketBot:
             use_mock_on_failure=config.get("pancake", {}).get("use_mock_on_failure", True),
             timeout=config.get("pancake", {}).get("timeout_seconds", 8),
         )
-        self.strategy = Strategy(config)
+        if strategy is not None:
+            self.strategy = strategy
+        else:
+            # Fallback: default GBM strategy
+            self.strategy = STRATEGIES["gbm"](config)
 
         # Share PancakeClient with trader for on-chain PnL resolution (live + paper)
         if hasattr(trader, '_pancake_client'):
@@ -265,6 +309,11 @@ class PolymarketBot:
         # Dashboard — imported here so Rich is only required when running the bot
         from dashboard import Dashboard
         self.dashboard = Dashboard(trader=trader, binance=self.binance, mode=mode)
+        self.dashboard._strategy_name = self.strategy.name
+        # Store strategy key for logging
+        self._strategy_key = next(
+            (k for k, v in STRATEGIES.items() if isinstance(self.strategy, v)), ""
+        )
 
         self._running = False
         self._last_epoch: int = -1
@@ -680,7 +729,7 @@ class PolymarketBot:
             loop.add_signal_handler(sig, self.stop)
 
         # Re-configure logging: reduce console to WARNING now that dashboard is active
-        setup_logging(self.config, dashboard_mode=True)
+        setup_logging(self.config, dashboard_mode=True, strategy_key=self._strategy_key)
 
         # Start the Rich Live display
         live = self.dashboard.start()
@@ -761,6 +810,12 @@ def main():
         action="store_true",
         help="Live trading mode (real on-chain transactions)",
     )
+    parser.add_argument(
+        "--strategy",
+        default="gbm",
+        choices=list(STRATEGIES.keys()),
+        help="Trading strategy to use (default: gbm)",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -776,9 +831,25 @@ def main():
         logging.info(f"Sample PancakeSwap round: {round_data}")
         sys.exit(0 if ok else 1)
 
+    # Determine strategy first (needed for per-strategy file paths)
+    if args.live or args.fresh or args.paper:
+        strategy_key = args.strategy
+        strategy_cls = STRATEGIES.get(strategy_key, STRATEGIES["gbm"])
+        strategy = strategy_cls(config)
+    else:
+        strategy = None  # will be set by interactive menu
+        strategy_key = None
+
+    # Helper: inject per-strategy file paths into config to isolate parallel runs
+    def _apply_strategy_paths(cfg: dict, s_key: str):
+        """Rewrite trade log paths to include strategy key for isolation."""
+        if s_key:
+            cfg.setdefault("paper_trading", {})["log_file"] = f"data/{s_key}/paper_trades.json"
+            cfg.setdefault("live_trading", {})["log_file"] = f"data/{s_key}/live_trades.json"
+
     # Determine trader based on CLI args or interactive menu
     if args.live:
-        # Non-interactive live mode
+        _apply_strategy_paths(config, strategy_key)
         from live_trader import LiveTrader
         try:
             trader = LiveTrader(config)
@@ -787,17 +858,34 @@ def main():
             logging.error(f"Live trading setup failed: {e}")
             sys.exit(1)
     elif args.fresh:
+        _apply_strategy_paths(config, strategy_key)
         reset_paper_trades(config)
         trader = PaperTrader(config)
         mode = "paper"
     elif args.paper:
+        _apply_strategy_paths(config, strategy_key)
         trader = PaperTrader(config)
         mode = "paper"
     else:
         # Interactive menu (plain print — before Rich Live starts)
-        mode, trader = select_mode_interactive(config)
+        mode, trader, strategy = select_mode_interactive(config)
+        # Find strategy key from STRATEGIES dict
+        strategy_key = next((k for k, v in STRATEGIES.items() if isinstance(strategy, v)), "unknown")
+        _apply_strategy_paths(config, strategy_key)
+        # Recreate trader with strategy-specific paths
+        if mode == "paper":
+            trader = PaperTrader(config)
+        # Live trader already created in _init_live_mode, paths set via config
 
-    bot = PolymarketBot(config, trader, mode=mode)
+    # Reconfigure logging with strategy-specific log dir
+    if strategy_key:
+        setup_logging(config, strategy_key=strategy_key)
+
+    # If ManualDirection strategy, prompt for direction before bot starts
+    if hasattr(strategy, 'prompt_direction') and strategy.direction is None:
+        strategy.prompt_direction()
+
+    bot = PolymarketBot(config, trader, mode=mode, strategy=strategy)
 
     try:
         asyncio.run(bot.run())

@@ -8,7 +8,15 @@
     "min_seconds_before_lock": 10,
     "momentum_window_seconds": 300,
     "min_prob_diff": 0.03,
-    "use_fair_odds": false
+    "use_fair_odds": false,
+    "orderbook_imbalance_threshold": 0.15,
+    "orderbook_depth_levels": 20,
+    "pool_imbalance_threshold": 0.75,
+    "pool_min_payout": 2.5,
+    "pool_min_bnb": 0.3,
+    "manual_min_payout": 1.5,
+    "reversion_min_zscore": 1.5,
+    "reversion_scaling": 0.10
   },
   "pancake": {
     "rpc_url": null,

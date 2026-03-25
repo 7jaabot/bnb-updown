@@ -343,7 +343,7 @@ def compute_position_size(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Strategy engine
+# Strategy engine (legacy — kept for backward compat; new strategies in src/strategies/)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Strategy:

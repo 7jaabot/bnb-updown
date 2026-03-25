@@ -202,6 +202,11 @@ class Dashboard:
             mode_str = "[bold blue]📝 PAPER[/bold blue]"
             first_line = f"Mode: {mode_str}"
 
+        # Strategy name
+        strategy_name = getattr(self, '_strategy_name', None)
+        if strategy_name:
+            first_line += f"  |  Strategy: {strategy_name}"
+
         # ── Line 2: BNB price + balance ──
         price_str = f"${bnb_price:.2f}" if bnb_price is not None else "[yellow]N/A[/yellow]"
 
