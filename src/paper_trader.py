@@ -2,7 +2,7 @@
 paper_trader.py — Paper trading simulator
 
 Simulates trades without real money or API calls.
-Logs all simulated trades to data/paper_trades.json.
+Logs all simulated trades to logs/<strategy>/paper_trades.json.
 Tracks PnL, win rate, and edge metrics.
 
 PnL is calculated using on-chain PancakeSwap round data (rewardAmount /
@@ -110,7 +110,7 @@ class PaperTrader:
         cfg_paper = config.get("paper_trading", {})
         cfg_strategy = config.get("strategy", {})
 
-        self.log_file = cfg_paper.get("log_file", "data/paper_trades.json")
+        self.log_file = cfg_paper.get("log_file", "logs/paper/trades.json")
         self.simulate_latency_ms = cfg_paper.get("simulate_latency_ms", 200)
         self.starting_bankroll = cfg_strategy.get("starting_bankroll_usdc", 1000.0)
 
@@ -198,6 +198,36 @@ class PaperTrader:
             json.dump(data, f, indent=2)
 
         logger.debug(f"Trades saved to {self.log_file}")
+        self._export_csv()
+
+    def _export_csv(self):
+        """Export all trades to a CSV file alongside the JSON log (for Google Sheets analysis)."""
+        import csv
+        from datetime import datetime
+
+        csv_path = self.log_file.replace(".json", ".csv")
+        os.makedirs(os.path.dirname(csv_path) if os.path.dirname(csv_path) else ".", exist_ok=True)
+
+        columns = [
+            "trade_id", "epoch", "timestamp_entry", "time_entry", "timestamp_exit", "time_exit",
+            "side", "side_label", "edge_at_entry", "p_up_at_entry", "kelly_fraction",
+            "position_size_usdc", "bet_bnb", "bnb_price_at_entry",
+            "bnb_open", "bnb_close", "outcome", "pnl_usdc", "payout_per_share", "is_mock",
+        ]
+
+        try:
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+                writer.writeheader()
+                for t in self._trades:
+                    row = t.to_dict()
+                    row["time_entry"] = datetime.fromtimestamp(t.timestamp_entry).strftime("%Y-%m-%d %H:%M:%S") if t.timestamp_entry else ""
+                    row["time_exit"] = datetime.fromtimestamp(t.timestamp_exit).strftime("%Y-%m-%d %H:%M:%S") if t.timestamp_exit else ""
+                    row["side_label"] = "UP" if t.side == "YES" else "DOWN"
+                    writer.writerow(row)
+            logger.debug(f"CSV exported to {csv_path}")
+        except Exception as e:
+            logger.warning(f"CSV export failed: {e}")
 
     def enter_trade(self, signal: Signal, window: WindowInfo) -> Optional[Trade]:
         """

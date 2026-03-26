@@ -35,12 +35,12 @@
     "symbol": "BNBUSDT"
   },
   "paper_trading": {
-    "log_file": "data/paper_trades.json",
+    "log_file": "logs/paper/trades.json",
     "simulate_latency_ms": 200
   },
   "live_trading": {
     "enabled": false,
-    "log_file": "data/live_trades.json",
+    "log_file": "logs/live/trades.json",
     "gas_price_buffer_pct": 0.10,
     "auto_claim": true
   },

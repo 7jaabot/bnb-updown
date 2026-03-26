@@ -6,5 +6,5 @@ __pycache__/
 *.egg-info/
 .env
 .env
-data/bot.log
-data/logs/
+data/
+logs/

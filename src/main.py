@@ -59,12 +59,12 @@ def _cleanup_old_logs(log_dir: str, max_days: int = 30):
                 pass
 
 
-def setup_logging(config: dict, dashboard_mode: bool = False, strategy_key: str = ""):
+def setup_logging(config: dict, dashboard_mode: bool = False, strategy_key: str = "", trading_mode: str = ""):
     """Configure logging from config.
 
     When dashboard_mode=True, reduces console handler to WARNING level
     (dashboard is the primary display) but keeps file logging at full level.
-    Log files are written as data/logs/<strategy>/run-YYYY-MM-DD.log (one per day per strategy).
+    Log files are written as logs/<mode>/<strategy>/run-YYYY-MM-DD.log.
     Files older than 30 days are deleted automatically.
     """
     import datetime
@@ -76,11 +76,13 @@ def setup_logging(config: dict, dashboard_mode: bool = False, strategy_key: str 
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
 
-    # Daily log file: data/logs/<strategy>/run-YYYY-MM-DD.log
+    # Daily log file: logs/<mode>/<strategy>/run-YYYY-MM-DD.log
+    parts = ["logs"]
+    if trading_mode:
+        parts.append(trading_mode)
     if strategy_key:
-        log_dir = os.path.join("data", "logs", strategy_key)
-    else:
-        log_dir = "data/logs"
+        parts.append(strategy_key)
+    log_dir = os.path.join(*parts) if len(parts) > 1 else "logs"
     os.makedirs(log_dir, exist_ok=True)
     today = datetime.date.today().strftime("%Y-%m-%d")
     log_file = os.path.join(log_dir, f"run-{today}.log")
@@ -145,7 +147,7 @@ def load_config(path: str) -> dict:
 
 def reset_paper_trades(config: dict):
     """Reset paper trading history."""
-    log_file = config.get("paper_trading", {}).get("log_file", "data/paper_trades.json")
+    log_file = config.get("paper_trading", {}).get("log_file", "logs/paper/trades.json")
     empty = {
         "metadata": {"last_updated": 0, "last_updated_iso": "", "total_trades": 0},
         "metrics": {
@@ -729,7 +731,7 @@ class PolymarketBot:
             loop.add_signal_handler(sig, self.stop)
 
         # Re-configure logging: reduce console to WARNING now that dashboard is active
-        setup_logging(self.config, dashboard_mode=True, strategy_key=self._strategy_key)
+        setup_logging(self.config, dashboard_mode=True, strategy_key=self._strategy_key, trading_mode=self.mode)
 
         # Start the Rich Live display
         live = self.dashboard.start()
@@ -844,8 +846,8 @@ def main():
     def _apply_strategy_paths(cfg: dict, s_key: str):
         """Rewrite trade log paths to include strategy key for isolation."""
         if s_key:
-            cfg.setdefault("paper_trading", {})["log_file"] = f"data/{s_key}/paper_trades.json"
-            cfg.setdefault("live_trading", {})["log_file"] = f"data/{s_key}/live_trades.json"
+            cfg.setdefault("paper_trading", {})["log_file"] = f"logs/paper/{s_key}/trades.json"
+            cfg.setdefault("live_trading", {})["log_file"] = f"logs/live/{s_key}/trades.json"
 
     # Determine trader based on CLI args or interactive menu
     if args.live:
@@ -877,9 +879,9 @@ def main():
             trader = PaperTrader(config)
         # Live trader already created in _init_live_mode, paths set via config
 
-    # Reconfigure logging with strategy-specific log dir
+    # Reconfigure logging with strategy- and mode-specific log dir
     if strategy_key:
-        setup_logging(config, strategy_key=strategy_key)
+        setup_logging(config, strategy_key=strategy_key, trading_mode=mode)
 
     # If ManualDirection strategy, prompt for direction before bot starts
     if hasattr(strategy, 'prompt_direction') and strategy.direction is None:
