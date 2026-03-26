@@ -846,8 +846,8 @@ def main():
     def _apply_strategy_paths(cfg: dict, s_key: str):
         """Rewrite trade log paths to include strategy key for isolation."""
         if s_key:
-            cfg.setdefault("paper_trading", {})["log_file"] = f"logs/paper/{s_key}/trades.json"
-            cfg.setdefault("live_trading", {})["log_file"] = f"logs/live/{s_key}/trades.json"
+            cfg.setdefault("paper_trading", {})["log_file"] = f"logs/paper/{s_key}/{s_key}.json"
+            cfg.setdefault("live_trading", {})["log_file"] = f"logs/live/{s_key}/{s_key}.json"
 
     # Determine trader based on CLI args or interactive menu
     if args.live:
