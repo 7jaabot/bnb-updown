@@ -218,17 +218,24 @@ def select_mode_interactive(config: dict) -> tuple[str, object, object]:
             break
         print("Invalid choice. Please enter 1, 2, or 3.")
 
+    # Select strategy FIRST so we can set paths before creating the trader
+    strategy = select_strategy_interactive(config)
+    strategy_key = next((k for k, v in STRATEGIES.items() if isinstance(strategy, v)), "unknown")
+
     if choice == "1":
+        # Apply strategy paths before creating live trader
+        config.setdefault("live_trading", {})["log_file"] = f"logs/live/{strategy_key}/{strategy_key}.json"
         mode, trader = _init_live_mode(config)
     elif choice == "2":
+        config.setdefault("paper_trading", {})["log_file"] = f"logs/paper/{strategy_key}/{strategy_key}.json"
         reset_paper_trades(config)
         trader = PaperTrader(config)
         mode = "paper"
     else:
+        config.setdefault("paper_trading", {})["log_file"] = f"logs/paper/{strategy_key}/{strategy_key}.json"
         trader = PaperTrader(config)
         mode = "paper"
 
-    strategy = select_strategy_interactive(config)
     return mode, trader, strategy
 
 
@@ -869,15 +876,9 @@ def main():
         trader = PaperTrader(config)
         mode = "paper"
     else:
-        # Interactive menu (plain print — before Rich Live starts)
+        # Interactive menu — strategy paths are set inside before trader creation
         mode, trader, strategy = select_mode_interactive(config)
-        # Find strategy key from STRATEGIES dict
         strategy_key = next((k for k, v in STRATEGIES.items() if isinstance(strategy, v)), "unknown")
-        _apply_strategy_paths(config, strategy_key)
-        # Recreate trader with strategy-specific paths
-        if mode == "paper":
-            trader = PaperTrader(config)
-        # Live trader already created in _init_live_mode, paths set via config
 
     # Reconfigure logging with strategy- and mode-specific log dir
     if strategy_key:
