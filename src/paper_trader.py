@@ -114,7 +114,7 @@ class PaperTrader:
         cfg_paper = config.get("paper_trading", {})
         cfg_strategy = config.get("strategy", {})
 
-        self.log_file = cfg_paper.get("log_file", "logs/paper/trades.json")
+        self.log_file = cfg_paper.get("log_file", "logs/paper/default/default.json")
         self.simulate_latency_ms = cfg_paper.get("simulate_latency_ms", 200)
         self.starting_bankroll = cfg_strategy.get("starting_bankroll_usdc", 1000.0)
 

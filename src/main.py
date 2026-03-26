@@ -147,7 +147,7 @@ def load_config(path: str) -> dict:
 
 def reset_paper_trades(config: dict):
     """Reset paper trading history."""
-    log_file = config.get("paper_trading", {}).get("log_file", "logs/paper/trades.json")
+    log_file = config.get("paper_trading", {}).get("log_file", "logs/paper/default/default.json")
     empty = {
         "metadata": {"last_updated": 0, "last_updated_iso": "", "total_trades": 0},
         "metrics": {

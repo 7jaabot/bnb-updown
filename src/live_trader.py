@@ -186,7 +186,7 @@ class LiveTrader:
         cfg_strategy = config.get("strategy", {})
         cfg_pancake = config.get("pancake", {})
 
-        self.log_file = cfg_live.get("log_file", "logs/live/trades.json")
+        self.log_file = cfg_live.get("log_file", "logs/live/default/default.json")
         self.gas_price_buffer_pct = cfg_live.get("gas_price_buffer_pct", 0.10)
         self.auto_claim = cfg_live.get("auto_claim", True)
 
