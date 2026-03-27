@@ -173,12 +173,18 @@ async function refreshEpochMap(sheets, existingTabs) {
 
   const sortedEpochs = [...allEpochs].sort((a,b) => parseInt(a)-parseInt(b));
 
-  // Build epoch map rows (starts at row 21 in the sheet — keep same structure)
-  const epRows = [['Epoch', ...STRATS, 'Actual', 'UP votes', 'DOWN votes']];
+  // Only include strategies that have data
+  const activeStrats = STRATS.filter(s => stratData[s] && Object.keys(stratData[s]).length > 0);
+
+  // Build epoch map rows — written to column J (right side), starting at J3
+  const epRows = [
+    ['═══ EPOCH MAP (refreshed hourly) ═══', ...Array(activeStrats.length).fill('')],
+    ['Epoch', ...activeStrats, 'Actual', 'UP votes', 'DOWN votes'],
+  ];
   for (const epoch of sortedEpochs) {
-    const sides = STRATS.map(s => stratData[s]?.[epoch]?.side || '');
+    const sides = activeStrats.map(s => stratData[s]?.[epoch]?.side || '');
     let actual = '';
-    for (const s of STRATS) {
+    for (const s of activeStrats) {
       const d = stratData[s]?.[epoch];
       if (d?.open > 0 && d?.close > 0) { actual = d.close > d.open ? 'UP' : 'DOWN'; break; }
     }
@@ -187,14 +193,14 @@ async function refreshEpochMap(sheets, existingTabs) {
     epRows.push([epoch, ...sides, actual, upVotes, downVotes]);
   }
 
-  // Clear and rewrite from row 20 (header) onward — leaves rows 1-19 (stats/filters) intact
+  // Clear RIGHT side only (J:Z) — don't touch left side (A-H = stats + combos)
   await sheets.spreadsheets.values.clear({
     spreadsheetId: SSID,
-    range: `'${stratTab}'!A20:J600`,
+    range: `'${stratTab}'!J1:Z600`,
   });
   await sheets.spreadsheets.values.update({
     spreadsheetId: SSID,
-    range: `'${stratTab}'!A20`,
+    range: `'${stratTab}'!J1`,
     valueInputOption: 'USER_ENTERED',
     requestBody: { values: epRows },
   });
