@@ -10,7 +10,7 @@
     "min_prob_diff": 0.03,
     "use_fair_odds": false,
     "orderbook_imbalance_threshold": 0.15,
-    "orderbook_depth_levels": 20,
+    "orderbook_depth_levels": 100,
     "pool_imbalance_threshold": 0.75,
     "pool_min_payout": 2.5,
     "pool_min_bnb": 0.3,

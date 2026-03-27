@@ -1,9 +1,15 @@
 """
-orderbook.py — Order Book Imbalance Strategy
+orderbook.py — Order Book Imbalance Strategy (v2)
 
-Fetches Binance BNB/USDT depth and measures bid/ask volume imbalance.
-More bids than asks → buying pressure → bet UP.
-More asks than bids → selling pressure → bet DOWN.
+Fetches Binance BNB/USDT depth (100 levels) and measures bid/ask volume imbalance,
+weighted by proximity to the mid price (closer orders = more weight).
+
+v2 changes vs v1 (commit 430dd43):
+  - Depth increased from 20 to 100 levels
+  - Distance-weighted imbalance (orders near mid count more)
+  - p_win capped at 0.60
+  - Edge capped at 0.20
+  - 2-snapshot averaging (5s apart) for noise reduction
 """
 
 import logging
@@ -19,20 +25,29 @@ logger = logging.getLogger(__name__)
 
 
 class OrderBookStrategy(BaseStrategy):
-    """Bid/ask imbalance from Binance order book."""
+    """Bid/ask imbalance from Binance order book (distance-weighted, multi-snapshot)."""
 
     def __init__(self, config: dict):
         super().__init__(config)
         cfg = config.get("strategy", {})
         self.imbalance_threshold = cfg.get("orderbook_imbalance_threshold", 0.15)
-        self.depth_levels = cfg.get("orderbook_depth_levels", 20)
+        self.depth_levels = cfg.get("orderbook_depth_levels", 100)
+        self._last_imbalance: Optional[float] = None
+        self._last_fetch_ts: float = 0.0
 
     @property
     def name(self) -> str:
         return "📊 Order Book Imbalance"
 
-    def _fetch_depth(self) -> Optional[tuple[float, float]]:
-        """Fetch bid/ask volumes from Binance. Returns (bid_vol, ask_vol) or None."""
+    def _fetch_weighted_imbalance(self) -> Optional[float]:
+        """
+        Fetch order book and compute distance-weighted imbalance.
+
+        Orders closer to mid price get exponentially more weight:
+          weight = 1 / (1 + distance_pct * 100)
+
+        Returns imbalance in [-1, 1] or None on failure.
+        """
         try:
             resp = requests.get(
                 "https://api.binance.com/api/v3/depth",
@@ -40,12 +55,69 @@ class OrderBookStrategy(BaseStrategy):
                 timeout=5,
             )
             data = resp.json()
-            bid_vol = sum(float(b[1]) for b in data.get("bids", []))
-            ask_vol = sum(float(a[1]) for a in data.get("asks", []))
-            return bid_vol, ask_vol
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+
+            if not bids or not asks:
+                return None
+
+            # Mid price
+            best_bid = float(bids[0][0])
+            best_ask = float(asks[0][0])
+            mid = (best_bid + best_ask) / 2.0
+
+            if mid <= 0:
+                return None
+
+            # Distance-weighted volume
+            weighted_bid = 0.0
+            for price_str, qty_str in bids:
+                price, qty = float(price_str), float(qty_str)
+                distance_pct = abs(mid - price) / mid
+                weight = 1.0 / (1.0 + distance_pct * 100)  # near = ~1.0, far = ~0.01
+                weighted_bid += qty * weight
+
+            weighted_ask = 0.0
+            for price_str, qty_str in asks:
+                price, qty = float(price_str), float(qty_str)
+                distance_pct = abs(price - mid) / mid
+                weight = 1.0 / (1.0 + distance_pct * 100)
+                weighted_ask += qty * weight
+
+            total = weighted_bid + weighted_ask
+            if total == 0:
+                return None
+
+            return (weighted_bid - weighted_ask) / total
+
         except Exception as e:
             logger.warning(f"Order book fetch failed: {e}")
             return None
+
+    def _get_averaged_imbalance(self) -> Optional[float]:
+        """
+        Average two snapshots ~5s apart for noise reduction.
+
+        On the first call in a window, fetch snapshot 1 and cache it.
+        On the second call (~5s later from the next tick), fetch snapshot 2 and average.
+        """
+        now = time.time()
+        current = self._fetch_weighted_imbalance()
+
+        if current is None:
+            return self._last_imbalance  # fallback to cached
+
+        if self._last_imbalance is not None and (now - self._last_fetch_ts) < 15:
+            # Average with previous snapshot
+            averaged = (self._last_imbalance + current) / 2.0
+            self._last_imbalance = current
+            self._last_fetch_ts = now
+            return averaged
+        else:
+            # First snapshot or too stale — just use current
+            self._last_imbalance = current
+            self._last_fetch_ts = now
+            return current
 
     def evaluate(
         self,
@@ -62,18 +134,10 @@ class OrderBookStrategy(BaseStrategy):
         if not window.is_entry_window and window.seconds_remaining > self.entry_window_seconds:
             return None
 
-        result = self._fetch_depth()
-        if result is None:
+        imbalance = self._get_averaged_imbalance()
+        if imbalance is None:
             self.last_skip_reason = "⏸ Could not fetch order book"
             return None
-
-        bid_vol, ask_vol = result
-        total = bid_vol + ask_vol
-        if total == 0:
-            self.last_skip_reason = "⏸ Empty order book"
-            return None
-
-        imbalance = (bid_vol - ask_vol) / total  # [-1, 1]
 
         if abs(imbalance) <= self.imbalance_threshold:
             self.last_skip_reason = (
@@ -82,11 +146,15 @@ class OrderBookStrategy(BaseStrategy):
             return None
 
         side = "YES" if imbalance > 0 else "NO"
-        edge = abs(imbalance) - self.imbalance_threshold
-        p_win = 0.5 + abs(imbalance) * 0.3  # rough: stronger imbalance → higher p_win, cap ~0.8
+
+        # Edge: capped at 0.20 to avoid overconfidence
+        edge = min(abs(imbalance) - self.imbalance_threshold, 0.20)
+
+        # p_win: capped at 0.60 (conservative for a noisy signal)
+        p_win = min(0.5 + abs(imbalance) * 0.2, 0.60)
 
         # Kelly sizing
-        odds = 1.0  # even money approximation
+        odds = 1.0
         raw_k = kelly_fraction(p_win, odds)
         if raw_k <= 0:
             self.last_skip_reason = f"⏸ Kelly negative (p_win={p_win:.2f})"
@@ -100,14 +168,14 @@ class OrderBookStrategy(BaseStrategy):
             return None
 
         logger.info(
-            f"OrderBook eval: imbalance={imbalance:+.3f} | bid={bid_vol:.1f} ask={ask_vol:.1f} | "
-            f"side={side} | edge={edge:.3f}"
+            f"OrderBook eval: imbalance={imbalance:+.3f} (weighted, averaged) | "
+            f"side={side} | edge={edge:.3f} | p_win={p_win:.3f}"
         )
 
         signal = Signal(
             side=side,
             edge=edge,
-            p_up=0.5 + imbalance * 0.3,
+            p_up=0.5 + imbalance * 0.2 if side == "YES" else 0.5 + imbalance * 0.2,
             yes_price=0.50,
             kelly_fraction=raw_k,
             position_size_usdc=pos_size,
