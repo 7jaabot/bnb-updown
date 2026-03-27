@@ -147,8 +147,8 @@ class OrderBookStrategy(BaseStrategy):
 
         side = "YES" if imbalance > 0 else "NO"
 
-        # Edge: capped at 0.20 to avoid overconfidence
-        edge = min(abs(imbalance) - self.imbalance_threshold, 0.20)
+        # Edge: raw value (no cap — p_win cap handles risk via Kelly)
+        edge = abs(imbalance) - self.imbalance_threshold
 
         # p_win: capped at 0.60 (conservative for a noisy signal)
         p_win = min(0.5 + abs(imbalance) * 0.2, 0.60)
