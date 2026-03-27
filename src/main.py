@@ -163,36 +163,127 @@ def reset_paper_trades(config: dict):
     logging.info(f"🧹 Fresh start: reset {log_file}")
 
 
+def prompt_edge_filter(strategy_label: str = "") -> 'EdgeFilter':
+    """
+    Prompt user for edge range filter.
+
+    Syntax:
+        (empty) → no filter
+        >0.1    → edge > 0.1
+        <0.3    → edge < 0.3
+        >0.1 <0.3 → 0.1 < edge < 0.3
+    """
+    from strategies.combined import EdgeFilter
+    label = f" for {strategy_label}" if strategy_label else ""
+    print(f"  Edge filter{label} (e.g. >0.1 <0.3, or ENTER for no filter):")
+    text = input("  Edge range: ").strip()
+    ef = EdgeFilter.parse(text)
+    if ef.min_edge is not None or ef.max_edge is not None:
+        print(f"  → Filter: {ef}")
+    else:
+        print(f"  → No edge filter")
+    return ef
+
+
 def select_strategy_interactive(config: dict):
     """Display strategy selection menu and return a strategy instance."""
+    from strategies.combined import CombinedStrategy, EdgeFilter
+
     strategy_list = list(STRATEGIES.items())
 
-    print("\n" + "=" * 40)
+    print("\n" + "=" * 50)
     print("  Select Strategy")
-    print("=" * 40)
+    print("=" * 50)
+    print("  [0] 🔗 Combined (multiple strategies consensus)")
     for i, (key, cls) in enumerate(strategy_list, 1):
-        # Instantiate temporarily to get the name
         try:
             name = cls(config).name
         except Exception:
             name = key
         print(f"  [{i}] {name}")
-    print("=" * 40)
+    print("=" * 50)
 
     while True:
         choice = input("Select strategy: ").strip()
         try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(strategy_list):
+            idx = int(choice)
+            if 0 <= idx <= len(strategy_list):
                 break
         except ValueError:
             pass
-        print(f"Invalid choice. Please enter 1-{len(strategy_list)}.")
+        print(f"Invalid choice. Please enter 0-{len(strategy_list)}.")
 
-    key, cls = strategy_list[idx]
-    strategy = cls(config)
-    print(f"  → Strategy: {strategy.name}\n")
-    return strategy
+    if idx == 0:
+        # Combined strategy mode
+        print("\n  🔗 Combined Strategy — select strategies to combine")
+        print("  Available strategies:")
+        for i, (key, cls) in enumerate(strategy_list, 1):
+            try:
+                name = cls(config).name
+            except Exception:
+                name = key
+            print(f"    [{i}] {name}")
+
+        while True:
+            combo_input = input("  Enter strategy numbers separated by commas (e.g. 1,4,11): ").strip()
+            try:
+                indices = [int(x.strip()) - 1 for x in combo_input.split(",")]
+                if all(0 <= i < len(strategy_list) for i in indices) and len(indices) >= 2:
+                    break
+            except ValueError:
+                pass
+            print(f"  Invalid. Enter at least 2 numbers between 1-{len(strategy_list)}, separated by commas.")
+
+        # Create sub-strategies and prompt edge filter for each
+        strategies = []
+        edge_filters = {}
+        for idx in indices:
+            key, cls = strategy_list[idx]
+            strat = cls(config)
+            strategies.append((key, strat))
+            print(f"\n  ── {strat.name} ──")
+            ef = prompt_edge_filter(strat.name)
+            if ef.min_edge is not None or ef.max_edge is not None:
+                edge_filters[key] = ef
+
+        combined = CombinedStrategy(config, strategies, edge_filters)
+        print(f"\n  → {combined.name}")
+        if edge_filters:
+            for name, ef in edge_filters.items():
+                print(f"    Edge filter {name}: {ef}")
+        print()
+        return combined
+
+    else:
+        # Single strategy mode
+        key, cls = strategy_list[idx - 1]
+        strategy = cls(config)
+        print(f"  → Strategy: {strategy.name}")
+
+        # Prompt edge filter
+        ef = prompt_edge_filter(strategy.name)
+        if ef.min_edge is not None or ef.max_edge is not None:
+            # Wrap in a simple edge-filtering wrapper
+            original_evaluate = strategy.evaluate
+
+            def filtered_evaluate(prices, yes_price, window, is_mock_data=False,
+                                  pool_total_bnb=0.0, pool_bull_bnb=0.0, pool_bear_bnb=0.0):
+                sig = original_evaluate(
+                    prices=prices, yes_price=yes_price, window=window,
+                    is_mock_data=is_mock_data, pool_total_bnb=pool_total_bnb,
+                    pool_bull_bnb=pool_bull_bnb, pool_bear_bnb=pool_bear_bnb,
+                )
+                if sig is not None and not ef.passes(sig.edge):
+                    strategy.last_skip_reason = (
+                        f"⏸ Edge {sig.edge:.3f} outside filter ({ef})"
+                    )
+                    return None
+                return sig
+
+            strategy.evaluate = filtered_evaluate
+
+        print()
+        return strategy
 
 
 def select_mode_interactive(config: dict) -> tuple[str, object, object]:
