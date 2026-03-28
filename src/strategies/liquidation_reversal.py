@@ -8,8 +8,8 @@ exhaust the dominant side.
   - If many SHORT positions just got liquidated (price spiked hard), buying
     pressure is exhausted → mean-reversion DOWN is more likely.
 
-Data source: Binance Futures public REST endpoint (no auth required)
-  GET https://fapi.binance.com/fapi/v1/allForceOrders?symbol=BNBUSDT
+Data source: Binance Futures WebSocket stream (no auth required)
+  wss://fstream.binance.com/ws/bnbusdt@forceOrder
 
 Side convention in Binance liquidation data:
   - side == "SELL"  → the system sold (liquidated) a LONG position
@@ -18,12 +18,20 @@ Side convention in Binance liquidation data:
 Edge = z-score of recent liq imbalance vs rolling baseline.
 """
 
+import asyncio
+import json
 import logging
+import threading
 import time
+from collections import deque
 from typing import Optional
 
 import numpy as np
-import requests
+
+try:
+    import websockets
+except ImportError:
+    websockets = None
 
 from .base import BaseStrategy
 from strategy import Signal, WindowInfo, compute_edge, compute_position_size
@@ -34,16 +42,189 @@ logger = logging.getLogger(__name__)
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-BINANCE_FUTURES_REST = "https://fapi.binance.com"
-FORCE_ORDERS_PATH = "/fapi/v1/allForceOrders"
+WS_URL = "wss://fstream.binance.com/ws/bnbusdt@forceOrder"
+
+# Max age of liquidation events to keep in buffer (seconds)
+_BUFFER_MAX_AGE_SECONDS = 3600  # 1 hour
 
 # How many historical buckets to keep for z-score baseline
-# Each bucket = 1 lookback window (default 5 min). We keep 12 → 1h of history.
 _HISTORY_MAX_BUCKETS = 12
 
 # Clamp for P(Up) from liquidation signal
 _P_UP_MIN = 0.35
 _P_UP_MAX = 0.65
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Liquidation event
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LiqEvent:
+    """A single liquidation event from the WebSocket stream."""
+    __slots__ = ("timestamp", "side", "qty", "price", "vol_usdt")
+
+    def __init__(self, timestamp: float, side: str, qty: float, price: float):
+        self.timestamp = timestamp
+        self.side = side  # "SELL" (long liq) or "BUY" (short liq)
+        self.qty = qty
+        self.price = price
+        self.vol_usdt = qty * price
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WebSocket listener (background thread)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LiquidationListener:
+    """
+    Background WebSocket listener for BNBUSDT forced liquidation events.
+    
+    Runs in a daemon thread, accumulates events in a thread-safe deque.
+    Auto-reconnects on disconnect.
+    """
+
+    def __init__(self):
+        self._events: deque[LiqEvent] = deque()
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._connected = False
+        self._total_received = 0
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    @property
+    def total_received(self) -> int:
+        return self._total_received
+
+    def start(self):
+        """Start the WebSocket listener in a background thread."""
+        if self._running:
+            return
+        if websockets is None:
+            logger.error("websockets package not installed — liquidation listener disabled")
+            return
+
+        self._running = True
+        self._thread = threading.Thread(target=self._run_thread, daemon=True, name="liq-ws")
+        self._thread.start()
+        logger.info(f"⚡ Liquidation WebSocket listener started → {WS_URL}")
+
+    def stop(self):
+        """Stop the listener."""
+        self._running = False
+        if self._loop:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        logger.info("⚡ Liquidation WebSocket listener stopped")
+
+    def get_events(self, lookback_seconds: float) -> list[LiqEvent]:
+        """Get liquidation events within the lookback window (thread-safe)."""
+        cutoff = time.time() - lookback_seconds
+        with self._lock:
+            return [e for e in self._events if e.timestamp >= cutoff]
+
+    def _prune_old(self):
+        """Remove events older than max buffer age."""
+        cutoff = time.time() - _BUFFER_MAX_AGE_SECONDS
+        with self._lock:
+            while self._events and self._events[0].timestamp < cutoff:
+                self._events.popleft()
+
+    def _run_thread(self):
+        """Entry point for the background thread."""
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._ws_loop())
+        except Exception as e:
+            logger.error(f"⚡ Liquidation listener thread crashed: {e}")
+        finally:
+            self._loop.close()
+
+    async def _ws_loop(self):
+        """Main WebSocket loop with auto-reconnect."""
+        while self._running:
+            try:
+                async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=10) as ws:
+                    self._connected = True
+                    logger.info("⚡ Liquidation WebSocket connected")
+
+                    while self._running:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=30.0)
+                            self._handle_message(raw)
+                        except asyncio.TimeoutError:
+                            # No liquidation in 30s — normal during quiet markets
+                            continue
+                        except websockets.ConnectionClosed:
+                            logger.warning("⚡ Liquidation WebSocket disconnected")
+                            break
+
+            except Exception as e:
+                logger.warning(f"⚡ Liquidation WebSocket error: {e}")
+
+            self._connected = False
+            if self._running:
+                logger.info("⚡ Liquidation WebSocket reconnecting in 5s...")
+                await asyncio.sleep(5)
+
+    def _handle_message(self, raw: str):
+        """Parse a forceOrder WebSocket message and store it."""
+        try:
+            msg = json.loads(raw)
+            # Format: {"e": "forceOrder", "E": <ts_ms>, "o": {order details}}
+            order = msg.get("o", {})
+            side = order.get("S", "")        # "SELL" or "BUY"
+            qty = float(order.get("q", 0))   # Original quantity
+            price = float(order.get("p", 0)) # Price
+            ts_ms = order.get("T", msg.get("E", int(time.time() * 1000)))
+
+            if side not in ("BUY", "SELL") or qty <= 0 or price <= 0:
+                return
+
+            event = LiqEvent(
+                timestamp=ts_ms / 1000.0,
+                side=side,
+                qty=qty,
+                price=price,
+            )
+
+            with self._lock:
+                self._events.append(event)
+            self._total_received += 1
+
+            # Periodic pruning (every 100 events)
+            if self._total_received % 100 == 0:
+                self._prune_old()
+
+            logger.debug(
+                f"⚡ Liq event: {side} {qty:.3f} BNB @ {price:.2f} "
+                f"= ${event.vol_usdt:.0f}"
+            )
+
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+            logger.warning(f"⚡ Failed to parse liq event: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Singleton listener (shared across strategy instances)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_global_listener: Optional[LiquidationListener] = None
+_listener_lock = threading.Lock()
+
+
+def _get_listener() -> LiquidationListener:
+    """Get or create the global liquidation listener."""
+    global _global_listener
+    with _listener_lock:
+        if _global_listener is None:
+            _global_listener = LiquidationListener()
+            _global_listener.start()
+        return _global_listener
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -54,13 +235,13 @@ class LiquidationReversalStrategy(BaseStrategy):
     """
     ⚡ Liquidation Reversal Strategy for BNB Up/Down 5mn.
 
-    Monitors recent forced liquidations on BNB perpetual futures.
+    Monitors recent forced liquidations on BNB perpetual futures via WebSocket.
     When a significant imbalance (z-score) is detected, bets on mean-reversion:
       - Large LONG liq volume → UP bet
       - Large SHORT liq volume → DOWN bet
 
     Config keys (under "liquidation_reversal" in strategy config):
-      liquidation_min_volume_usdt (float): minimum net liq volume to trigger (default 100_000)
+      liquidation_min_volume_usdt (float): minimum net liq volume to trigger (default 50_000)
       liquidation_lookback_minutes (float): look-back window in minutes (default 5)
     """
 
@@ -73,75 +254,30 @@ class LiquidationReversalStrategy(BaseStrategy):
 
         # Strategy-specific config
         liq_cfg = config.get("liquidation_reversal", {})
-        self.min_volume_usdt: float = liq_cfg.get("liquidation_min_volume_usdt", 100_000.0)
+        self.min_volume_usdt: float = liq_cfg.get("liquidation_min_volume_usdt", 50_000.0)
         self.lookback_minutes: float = liq_cfg.get("liquidation_lookback_minutes", 5.0)
 
         # Rolling history of (long_vol_usdt, short_vol_usdt) per window
-        # Used to compute z-score baseline
-        self._history: list[tuple[float, float]] = []  # [(long_vol, short_vol), ...]
-
-        # Response cache: (timestamp_fetched, raw_data)
-        self._cache_ts: float = 0.0
-        self._cache_data: list[dict] = []
-        self._cache_ttl: float = 10.0  # seconds — avoid hammering API
+        self._history: list[tuple[float, float]] = []
 
         # Use fair-odds or pool-derived price
         cfg_s = config.get("strategy", {})
         self.use_fair_odds: bool = cfg_s.get("use_fair_odds", True)
         self.FAIR_ODDS_PRICE: float = 0.50
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Data fetching
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _fetch_liquidations(self, lookback_minutes: float) -> list[dict]:
-        """
-        Fetch recent BNBUSDT liquidation orders from Binance Futures REST API.
-
-        Public endpoint — no API key required.
-
-        Returns:
-            List of liquidation order dicts with at minimum:
-              - side: "BUY" (short liq) or "SELL" (long liq)
-              - executedQty: filled quantity in BNB
-              - averagePrice: fill price in USDT
-              - time: Unix timestamp in ms
-        """
-        now_ms = int(time.time() * 1000)
-        start_ms = now_ms - int(lookback_minutes * 60 * 1000)
-
-        # Cache hit?
-        if time.time() - self._cache_ts < self._cache_ttl and self._cache_data:
-            # Filter cached data to the lookback window
-            return [r for r in self._cache_data if r.get("time", 0) >= start_ms]
-
-        try:
-            resp = requests.get(
-                BINANCE_FUTURES_REST + FORCE_ORDERS_PATH,
-                params={
-                    "symbol": "BNBUSDT",
-                    "startTime": start_ms,
-                    "limit": 1000,  # max allowed
-                },
-                timeout=5.0,
-            )
-            resp.raise_for_status()
-            data: list[dict] = resp.json()
-            self._cache_ts = time.time()
-            self._cache_data = data
-            logger.debug(f"Fetched {len(data)} BNBUSDT liquidation records from Binance")
-            return data
-        except Exception as exc:
-            logger.warning(f"⚡ Liquidation fetch failed: {exc}")
-            return []
+        # Listener initialized lazily on first evaluate() call
+        self._listener: Optional[LiquidationListener] = None
 
     # ─────────────────────────────────────────────────────────────────────────
     # Volume aggregation
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _aggregate_volumes(
-        self, liquidations: list[dict], lookback_minutes: float
-    ) -> tuple[float, float]:
+    def _ensure_listener(self):
+        """Lazily start the WebSocket listener on first use."""
+        if self._listener is None:
+            self._listener = _get_listener()
+
+    def _aggregate_volumes(self, lookback_minutes: float) -> tuple[float, float]:
         """
         Sum liquidation volumes by side within the lookback window.
 
@@ -150,30 +286,15 @@ class LiquidationReversalStrategy(BaseStrategy):
               long_vol_usdt : USDT value of liquidated LONG positions (side == "SELL")
               short_vol_usdt: USDT value of liquidated SHORT positions (side == "BUY")
         """
-        cutoff_ms = int((time.time() - lookback_minutes * 60) * 1000)
+        events = self._listener.get_events(lookback_minutes * 60)
         long_vol = 0.0
         short_vol = 0.0
 
-        for order in liquidations:
-            ts = order.get("time", 0)
-            if ts < cutoff_ms:
-                continue
-
-            side = order.get("side", "")
-            try:
-                qty = float(order.get("executedQty", 0) or 0)
-                price = float(order.get("averagePrice", 0) or 0)
-            except (TypeError, ValueError):
-                continue
-
-            vol_usdt = qty * price
-
-            if side == "SELL":
-                # System sold (liquidated) a LONG position → long liq
-                long_vol += vol_usdt
-            elif side == "BUY":
-                # System bought back (liquidated) a SHORT position → short liq
-                short_vol += vol_usdt
+        for e in events:
+            if e.side == "SELL":
+                long_vol += e.vol_usdt
+            elif e.side == "BUY":
+                short_vol += e.vol_usdt
 
         return long_vol, short_vol
 
@@ -198,7 +319,7 @@ class LiquidationReversalStrategy(BaseStrategy):
         mu = float(np.mean(historical_nets))
         sigma = float(np.std(historical_nets))
 
-        if sigma < 1.0:  # Avoid division by near-zero
+        if sigma < 1.0:
             return 0.0
 
         return (net_imbalance - mu) / sigma
@@ -219,12 +340,7 @@ class LiquidationReversalStrategy(BaseStrategy):
 
         Positive z-score (long liq dominates) → P(Up) > 0.5
         Negative z-score (short liq dominates) → P(Up) < 0.5
-
-        Uses a logistic-like mapping clamped to [_P_UP_MIN, _P_UP_MAX].
-        Each 1-sigma of imbalance adds ~5% to our P(Up) estimate.
         """
-        # Base: logistic mapping with scale factor 0.05 per z-unit
-        # z=2 → +0.10, z=-2 → -0.10
         delta = 0.05 * zscore
         p_up = 0.5 + delta
         return max(_P_UP_MIN, min(_P_UP_MAX, p_up))
@@ -249,32 +365,36 @@ class LiquidationReversalStrategy(BaseStrategy):
         if not window.is_entry_window and window.seconds_remaining > self.entry_window_seconds:
             return None
 
-        # ── 1. Fetch liquidation data ─────────────────────────────────────────
-        raw_liqs = self._fetch_liquidations(self.lookback_minutes)
+        # Ensure WebSocket listener is running
+        self._ensure_listener()
 
-        # ── 2. Aggregate volumes ──────────────────────────────────────────────
-        long_vol, short_vol = self._aggregate_volumes(raw_liqs, self.lookback_minutes)
-        net_imbalance = long_vol - short_vol  # >0 → long liq dominant → UP signal
+        # Check WebSocket status
+        if not self._listener.connected and self._listener.total_received == 0:
+            self.last_skip_reason = "⏸ Liquidation WebSocket not yet connected"
+            return None
 
+        # ── 1. Aggregate volumes ──────────────────────────────────────────────
+        long_vol, short_vol = self._aggregate_volumes(self.lookback_minutes)
+        net_imbalance = long_vol - short_vol
         total_vol = long_vol + short_vol
 
         logger.info(
             f"⚡ Liq volumes ({self.lookback_minutes:.0f}m): "
             f"LONG={long_vol/1000:.1f}k SHORT={short_vol/1000:.1f}k "
-            f"TOTAL={total_vol/1000:.1f}k USDT"
+            f"TOTAL={total_vol/1000:.1f}k USDT "
+            f"(ws_events={self._listener.total_received})"
         )
 
-        # ── 3. Minimum volume threshold ───────────────────────────────────────
+        # ── 2. Minimum volume threshold ───────────────────────────────────────
         if total_vol < self.min_volume_usdt:
             self.last_skip_reason = (
                 f"⏸ Total liq volume too low "
                 f"({total_vol/1000:.1f}k < {self.min_volume_usdt/1000:.0f}k USDT)"
             )
-            # Still update history so baseline grows
             self._update_history(long_vol, short_vol)
             return None
 
-        # ── 4. Z-score computation ────────────────────────────────────────────
+        # ── 3. Z-score computation ────────────────────────────────────────────
         zscore = self._compute_zscore(net_imbalance)
         self._update_history(long_vol, short_vol)
 
@@ -283,17 +403,16 @@ class LiquidationReversalStrategy(BaseStrategy):
             f"z={zscore:+.2f} (history={len(self._history)} buckets)"
         )
 
-        # Need a meaningful z-score to have an edge
         if abs(zscore) < 1.0:
             self.last_skip_reason = (
                 f"⏸ Liq z-score too low ({zscore:+.2f} < ±1.0) — no edge"
             )
             return None
 
-        # ── 5. P(Up) from liquidation signal ─────────────────────────────────
+        # ── 4. P(Up) from liquidation signal ─────────────────────────────────
         p_up = self._estimate_p_up(zscore)
 
-        # ── 6. Compare vs pool/fair price ────────────────────────────────────
+        # ── 5. Compare vs pool/fair price ────────────────────────────────────
         effective_yes_price = (
             self.FAIR_ODDS_PRICE if self.use_fair_odds else yes_price
         )
@@ -304,7 +423,7 @@ class LiquidationReversalStrategy(BaseStrategy):
             f"price={effective_yes_price:.3f} edge={edge:.3f} side={side}"
         )
 
-        # ── 7. Edge threshold ─────────────────────────────────────────────────
+        # ── 6. Edge threshold ─────────────────────────────────────────────────
         if edge <= self.edge_threshold:
             self.last_skip_reason = (
                 f"⏸ Edge too low ({edge:.3f} ≤ {self.edge_threshold:.2f}) | "
@@ -312,7 +431,7 @@ class LiquidationReversalStrategy(BaseStrategy):
             )
             return None
 
-        # ── 8. Position sizing ────────────────────────────────────────────────
+        # ── 7. Position sizing ────────────────────────────────────────────────
         raw_k, pos_size = compute_position_size(
             edge=edge,
             p_up=p_up,
@@ -354,7 +473,7 @@ class LiquidationReversalStrategy(BaseStrategy):
                     )
                     return None
 
-        # ── 9. Build signal ───────────────────────────────────────────────────
+        # ── 8. Build signal ───────────────────────────────────────────────────
         signal = Signal(
             side=side,
             edge=edge,
