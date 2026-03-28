@@ -133,7 +133,7 @@ async function main() {
 async function refreshStrategyComparison(sheets, existingTabs) {
   const SSID = SPREADSHEET_ID;
   const analysisTabs = ['🏆 Strategy Comparison', '🔗 Cross-Strategy (Epoch)', '📊 Deep Edge Analysis', '🎯 Optimal Filters', '📈 PnL Curves', '🕐 Time Heatmap'];
-  const STRATS = existingTabs.filter(t => !analysisTabs.includes(t));
+  const STRATS = existingTabs.filter(t => !analysisTabs.includes(t) && !t.startsWith('combined_'));
   const tab = existingTabs.find(t => t.includes('Strategy Comparison'));
   if (!tab) { console.log('  ⏸ Strategy Comparison tab not found'); return; }
 
@@ -250,7 +250,7 @@ async function refreshStrategyComparison(sheets, existingTabs) {
 async function refreshDeepEdge(sheets, existingTabs) {
   const SSID = SPREADSHEET_ID;
   const analysisTabs = ['🏆 Strategy Comparison', '🔗 Cross-Strategy (Epoch)', '📊 Deep Edge Analysis', '🎯 Optimal Filters', '📈 PnL Curves', '🕐 Time Heatmap'];
-  const STRATS = existingTabs.filter(t => !analysisTabs.includes(t));
+  const STRATS = existingTabs.filter(t => !analysisTabs.includes(t) && !t.startsWith('combined_'));
   const tab = existingTabs.find(t => t.includes('Deep Edge'));
   if (!tab) { console.log('  ⏸ Deep Edge tab not found'); return; }
 
@@ -327,7 +327,7 @@ async function refreshEpochMap(sheets, existingTabs) {
   const SSID = SPREADSHEET_ID;
   // Dynamically detect strategy tabs (exclude analysis tabs)
   const analysisTabs = ['🏆 Strategy Comparison', '🔗 Cross-Strategy (Epoch)', '📊 Deep Edge Analysis', '🎯 Optimal Filters', '📈 PnL Curves', '🕐 Time Heatmap'];
-  const STRATS = existingTabs.filter(t => !analysisTabs.includes(t));
+  const STRATS = existingTabs.filter(t => !analysisTabs.includes(t) && !t.startsWith('combined_'));
   const stratTab = existingTabs.find(t => t.toLowerCase() === '🔗 cross-strategy (epoch)'.toLowerCase())
     || '🔗 Cross-Strategy (Epoch)';
 
