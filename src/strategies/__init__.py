@@ -15,6 +15,7 @@ from .correlation_arbitrage import CorrelationArbitrageStrategy
 from .fear_greed_micro import FearGreedMicroStrategy
 from .whale_signal import WhaleSignalStrategy
 from .bollinger_squeeze import BollingerSqueezeStrategy
+from .llm_price_action import LLMPriceActionStrategy
 
 STRATEGIES = {
     "gbm": GBMStrategy,
@@ -33,4 +34,5 @@ STRATEGIES = {
     "fear_greed_micro": FearGreedMicroStrategy,
     "whale_signal": WhaleSignalStrategy,
     "bollinger_squeeze": BollingerSqueezeStrategy,
+    "llm_price_action": LLMPriceActionStrategy,
 }
