@@ -90,9 +90,6 @@ class LLMPriceActionStrategy(BaseStrategy):
             or ""
         )
 
-        # Minimum confidence to trade (0.60 = 60%)
-        self.min_confidence: float = cfg.get("llm_min_confidence", 0.60)
-
         # HTTP timeout for API calls
         self._http_timeout: float = cfg.get("llm_http_timeout", 10.0)
 
@@ -298,19 +295,12 @@ class LLMPriceActionStrategy(BaseStrategy):
             self.last_skip_reason = f"⏸ [LLM] SKIP — {reasoning}"
             return None
 
-        if confidence < self.min_confidence:
-            self.last_skip_reason = (
-                f"⏸ [LLM] Confidence too low ({confidence:.2f} < {self.min_confidence:.2f}) "
-                f"| {direction} — {reasoning}"
-            )
-            return None
-
         # Convert to Signal
         side = "YES" if direction == "UP" else "NO"
         p_up = confidence if direction == "UP" else (1.0 - confidence)
 
-        # Edge from confidence deviation from 0.5
-        edge = abs(confidence - 0.5) * 2.0  # 0.60 → 0.20, 0.75 → 0.50
+        # Edge from confidence: 0.55 → 0.10, 0.60 → 0.20, 0.75 → 0.50
+        edge = abs(confidence - 0.5) * 2.0
 
         if edge <= self.edge_threshold:
             self.last_skip_reason = (
