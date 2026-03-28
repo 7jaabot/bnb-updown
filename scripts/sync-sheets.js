@@ -117,16 +117,216 @@ async function main() {
     console.log(`  ✅ ${actualTab}: ${rows.length - 1} trades synced`);
   }
 
-  // Refresh the Cross-Strategy Epoch Map
+  // Refresh all analysis tabs
   await refreshEpochMap(sheets, existingTabs);
+  await refreshStrategyComparison(sheets, existingTabs);
+  await refreshDeepEdge(sheets, existingTabs);
 
   console.log('Done.');
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🏆 Strategy Comparison — fully dynamic, computed from data
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function refreshStrategyComparison(sheets, existingTabs) {
+  const SSID = SPREADSHEET_ID;
+  const analysisTabs = ['🏆 Strategy Comparison', '🔗 Cross-Strategy (Epoch)', '📊 Deep Edge Analysis', '🎯 Optimal Filters', '📈 PnL Curves', '🕐 Time Heatmap'];
+  const STRATS = existingTabs.filter(t => !analysisTabs.includes(t));
+  const tab = existingTabs.find(t => t.includes('Strategy Comparison'));
+  if (!tab) { console.log('  ⏸ Strategy Comparison tab not found'); return; }
+
+  // Load all trade data
+  const results = [];
+  for (const s of STRATS) {
+    const actualTab = existingTabs.find(t => t.toLowerCase() === s.toLowerCase()) || s;
+    try {
+      const res = await sheets.spreadsheets.values.get({ spreadsheetId: SSID, range: `'${actualTab}'!A1:V5000` });
+      const rows = res.data.values || [];
+      if (rows.length < 2) continue;
+      const h = rows[0];
+      const iSide = h.indexOf('side_label'), iOutcome = h.indexOf('outcome');
+      const iEdge = h.indexOf('edge_at_entry'), iPnl = h.indexOf('pnl_usdc');
+      const iPos = h.indexOf('position_size_usdc'), iPayout = h.indexOf('payout_per_share');
+
+      const trades = [];
+      for (let i = 1; i < rows.length; i++) {
+        const r = rows[i];
+        const outcome = r[iOutcome] || '';
+        if (outcome !== 'WIN' && outcome !== 'LOSS') continue;
+        trades.push({
+          side: r[iSide] || '',
+          outcome,
+          edge: parseFloat(r[iEdge]) || 0,
+          pnl: parseFloat(r[iPnl]) || 0,
+          pos: parseFloat(r[iPos]) || 0,
+          payout: parseFloat(r[iPayout]) || 0,
+        });
+      }
+      if (trades.length === 0) continue;
+
+      const wins = trades.filter(t => t.outcome === 'WIN');
+      const losses = trades.filter(t => t.outcome === 'LOSS');
+      const total = trades.length;
+      const wr = total > 0 ? wins.length / total * 100 : 0;
+      const pnl = trades.reduce((s, t) => s + t.pnl, 0);
+      const avgEdge = trades.reduce((s, t) => s + t.edge, 0) / total;
+      const upTrades = trades.filter(t => t.side === 'UP');
+      const downTrades = trades.filter(t => t.side === 'DOWN');
+      const upWr = upTrades.length > 0 ? upTrades.filter(t => t.outcome === 'WIN').length / upTrades.length * 100 : 0;
+      const downWr = downTrades.length > 0 ? downTrades.filter(t => t.outcome === 'WIN').length / downTrades.length * 100 : 0;
+      const avgWinPnl = wins.length > 0 ? wins.reduce((s, t) => s + t.pnl, 0) / wins.length : 0;
+      const avgLossPnl = losses.length > 0 ? losses.reduce((s, t) => s + t.pnl, 0) / losses.length : 0;
+      const rr = avgLossPnl !== 0 ? Math.abs(avgWinPnl / avgLossPnl) : 0;
+      const wagered = trades.reduce((s, t) => s + t.pos, 0);
+      const roi = wagered > 0 ? pnl / wagered * 100 : 0;
+
+      results.push([
+        s, total, wins.length, losses.length,
+        r2(wr), r2(pnl), r2(pnl / total), r4(avgEdge),
+        upTrades.length, downTrades.length,
+        r2(upWr), r2(downWr),
+        r2(avgWinPnl), r2(avgLossPnl), r2(rr), r2(roi),
+      ]);
+    } catch(e) {
+      console.log(`  ⚠️ Comparison: could not load ${s}: ${e.message}`);
+    }
+  }
+
+  const n = results.length;
+  const outputRows = [
+    [`🏆 Strategy Comparison — ${n} Strategies`],
+    ['WIN+LOSS only. Updated hourly by sync script.'],
+    [],
+    ['Strategy', 'Trades (W+L)', 'Wins', 'Losses', 'Win Rate %', 'Total PnL ($)',
+     'Avg PnL/Trade ($)', 'Avg Edge', 'UP Trades', 'DOWN Trades', 'UP WR %', 'DOWN WR %',
+     'Avg WIN PnL ($)', 'Avg LOSS PnL ($)', 'R/R Ratio', 'ROI %'],
+    ...results,
+    [],
+    ['📊 COMBINED'],
+  ];
+
+  // Combined row
+  const totTrades = results.reduce((s, r) => s + r[1], 0);
+  const totWins = results.reduce((s, r) => s + r[2], 0);
+  const totLosses = results.reduce((s, r) => s + r[3], 0);
+  const totPnl = results.reduce((s, r) => s + r[5], 0);
+  const totWr = totTrades > 0 ? totWins / totTrades * 100 : 0;
+  outputRows.push(['ALL', totTrades, totWins, totLosses, r2(totWr), r2(totPnl), r2(totTrades > 0 ? totPnl / totTrades : 0)]);
+
+  // Best/worst (min 30 trades)
+  const eligible = results.filter(r => r[1] >= 30);
+  if (eligible.length > 0) {
+    const bestWr = eligible.reduce((b, r) => r[4] > b[4] ? r : b);
+    const bestPnl = eligible.reduce((b, r) => r[5] > b[5] ? r : b);
+    const worstPnl = eligible.reduce((b, r) => r[5] < b[5] ? r : b);
+    outputRows.push(['🥇 Best Win Rate (min 30)', bestWr[0], bestWr[4] + '%']);
+    outputRows.push(['🥇 Best PnL (min 30)', bestPnl[0], '$' + bestPnl[5]]);
+    outputRows.push(['❌ Worst PnL (min 30)', worstPnl[0], '$' + worstPnl[5]]);
+  } else {
+    outputRows.push(['🥇 Best Win Rate (min 30)', 'Not enough data']);
+    outputRows.push(['🥇 Best PnL (min 30)', 'Not enough data']);
+    outputRows.push(['❌ Worst PnL (min 30)', 'Not enough data']);
+  }
+  const worstAll = results.length > 0 ? results.reduce((b, r) => r[5] < b[5] ? r : b) : null;
+  outputRows.push(['❌ Worst PnL ($)', worstAll ? worstAll[0] : 'N/A', worstAll ? '$' + worstAll[5] : 'N/A']);
+
+  await sheets.spreadsheets.values.clear({ spreadsheetId: SSID, range: `'${tab}'!A1:P50` });
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SSID, range: `'${tab}'!A1`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: outputRows },
+  });
+
+  console.log(`  ✅ Strategy Comparison refreshed: ${n} strategies`);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 📊 Deep Edge Analysis — fully dynamic, computed from data
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function refreshDeepEdge(sheets, existingTabs) {
+  const SSID = SPREADSHEET_ID;
+  const analysisTabs = ['🏆 Strategy Comparison', '🔗 Cross-Strategy (Epoch)', '📊 Deep Edge Analysis', '🎯 Optimal Filters', '📈 PnL Curves', '🕐 Time Heatmap'];
+  const STRATS = existingTabs.filter(t => !analysisTabs.includes(t));
+  const tab = existingTabs.find(t => t.includes('Deep Edge'));
+  if (!tab) { console.log('  ⏸ Deep Edge tab not found'); return; }
+
+  const buckets = [[0, 0.1], [0.1, 0.2], [0.2, 0.3], [0.3, 0.4], [0.4, 0.5], [0.5, 1.0]];
+  const outputRows = [];
+  let stratCount = 0;
+
+  for (const s of STRATS) {
+    const actualTab = existingTabs.find(t => t.toLowerCase() === s.toLowerCase()) || s;
+    try {
+      const res = await sheets.spreadsheets.values.get({ spreadsheetId: SSID, range: `'${actualTab}'!A1:V5000` });
+      const rows = res.data.values || [];
+      if (rows.length < 2) continue;
+      const h = rows[0];
+      const iOutcome = h.indexOf('outcome'), iEdge = h.indexOf('edge_at_entry');
+      const iPnl = h.indexOf('pnl_usdc'), iPayout = h.indexOf('payout_per_share');
+
+      const trades = [];
+      for (let i = 1; i < rows.length; i++) {
+        const r = rows[i];
+        const outcome = r[iOutcome] || '';
+        if (outcome !== 'WIN' && outcome !== 'LOSS') continue;
+        trades.push({
+          outcome,
+          edge: parseFloat(r[iEdge]) || 0,
+          pnl: parseFloat(r[iPnl]) || 0,
+          payout: parseFloat(r[iPayout]) || 0,
+        });
+      }
+      if (trades.length === 0) continue;
+
+      stratCount++;
+      outputRows.push([`═══ ${s} ═══`]);
+      outputRows.push(['Edge Bucket', 'Trades', 'Wins', 'Win Rate %', 'PnL ($)', 'Avg Payout (win)']);
+
+      for (const [lo, hi] of buckets) {
+        const bucket = trades.filter(t => t.edge >= lo && t.edge < hi);
+        const bWins = bucket.filter(t => t.outcome === 'WIN');
+        const bTotal = bucket.length;
+        const bWr = bTotal > 0 ? bWins.length / bTotal * 100 : 0;
+        const bPnl = bucket.reduce((s, t) => s + t.pnl, 0);
+        const bAvgPayout = bWins.length > 0 ? bWins.reduce((s, t) => s + t.payout, 0) / bWins.length : 0;
+        outputRows.push([
+          `${lo.toFixed(2)}-${hi.toFixed(2)}`,
+          bTotal, bWins.length, r2(bWr), r2(bPnl), r4(bAvgPayout),
+        ]);
+      }
+      outputRows.push([]);
+    } catch(e) {
+      console.log(`  ⚠️ Deep Edge: could not load ${s}: ${e.message}`);
+    }
+  }
+
+  // Title
+  const header = [`📊 Deep Edge Analysis — All ${stratCount} Strategies (WIN+LOSS only)`];
+  const allRows = [header, [], ...outputRows];
+
+  await sheets.spreadsheets.values.clear({ spreadsheetId: SSID, range: `'${tab}'!A1:G300` });
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SSID, range: `'${tab}'!A1`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: allRows },
+  });
+
+  console.log(`  ✅ Deep Edge refreshed: ${stratCount} strategies`);
+}
+
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+function r2(n) { return Math.round(n * 100) / 100; }
+function r4(n) { return Math.round(n * 10000) / 10000; }
+
 async function refreshEpochMap(sheets, existingTabs) {
   const SSID = SPREADSHEET_ID;
   // Dynamically detect strategy tabs (exclude analysis tabs)
-  const analysisTabs = ['🏆 Strategy Comparison', '🔗 Cross-Strategy (Epoch)', '📊 Deep Edge Analysis', '🎯 Optimal Filters', '📈 PnL Curves'];
+  const analysisTabs = ['🏆 Strategy Comparison', '🔗 Cross-Strategy (Epoch)', '📊 Deep Edge Analysis', '🎯 Optimal Filters', '📈 PnL Curves', '🕐 Time Heatmap'];
   const STRATS = existingTabs.filter(t => !analysisTabs.includes(t));
   const stratTab = existingTabs.find(t => t.toLowerCase() === '🔗 cross-strategy (epoch)'.toLowerCase())
     || '🔗 Cross-Strategy (Epoch)';
@@ -136,8 +336,8 @@ async function refreshEpochMap(sheets, existingTabs) {
     return;
   }
 
-  // Load resolved trades per strategy
-  const stratData = {};
+  // ── Load resolved trades per strategy ─────────────────────────────────
+  const stratData = {};   // { stratName: { epoch: { side, open, close, edge, pnl } } }
   const allEpochs = new Set();
   for (const s of STRATS) {
     const actualTab = existingTabs.find(t => t.toLowerCase() === s.toLowerCase()) || s;
@@ -152,6 +352,7 @@ async function refreshEpochMap(sheets, existingTabs) {
       const openIdx = headers.indexOf('bnb_open');
       const closeIdx = headers.indexOf('bnb_close');
       const edgeIdx = headers.indexOf('edge_at_entry');
+      const pnlIdx = headers.indexOf('pnl_usdc');
       stratData[s] = {};
       for (let i = 1; i < rows.length; i++) {
         const r = rows[i];
@@ -162,8 +363,11 @@ async function refreshEpochMap(sheets, existingTabs) {
         allEpochs.add(epoch);
         stratData[s][epoch] = {
           side: r[sideIdx] || '',
+          outcome,
           open: parseFloat(r[openIdx]) || 0,
           close: parseFloat(r[closeIdx]) || 0,
+          edge: parseFloat(r[edgeIdx]) || 0,
+          pnl: parseFloat(r[pnlIdx]) || 0,
         };
       }
     } catch(e) {
@@ -172,11 +376,9 @@ async function refreshEpochMap(sheets, existingTabs) {
   }
 
   const sortedEpochs = [...allEpochs].sort((a,b) => parseInt(a)-parseInt(b));
-
-  // Only include strategies that have data
   const activeStrats = STRATS.filter(s => stratData[s] && Object.keys(stratData[s]).length > 0);
 
-  // Build epoch map rows — written to column J (right side), starting at J3
+  // ── RIGHT SIDE: Epoch Map (J:...) ─────────────────────────────────────
   const epRows = [
     ['═══ EPOCH MAP (refreshed hourly) ═══', ...Array(activeStrats.length).fill('')],
     ['Epoch', ...activeStrats, 'Actual', 'UP votes', 'DOWN votes'],
@@ -193,11 +395,145 @@ async function refreshEpochMap(sheets, existingTabs) {
     epRows.push([epoch, ...sides, actual, upVotes, downVotes]);
   }
 
-  // Clear RIGHT side only (J:Z) — don't touch left side (A-H = stats + combos)
+  // ── LEFT SIDE: Per-Strategy Stats + Combinations (A:H) ───────────────
+  const leftRows = [];
+
+  // Header
+  leftRows.push(['🔗 Cross-Strategy Consensus']);
+  leftRows.push([]);
+  leftRows.push([`📊 Per-Strategy Stats (${activeStrats.length} strategies, WIN+LOSS only)`]);
+  leftRows.push(['Strategy', 'Trades', 'Wins', 'Win Rate %', 'PnL ($)', 'Avg Edge']);
+
+  // Per-strategy stats (computed from data, not formulas)
+  const stratStats = [];
+  for (const s of activeStrats) {
+    const trades = Object.values(stratData[s]);
+    const wins = trades.filter(t => t.outcome === 'WIN').length;
+    const losses = trades.filter(t => t.outcome === 'LOSS').length;
+    const total = wins + losses;
+    const wr = total > 0 ? (wins / total * 100) : 0;
+    const pnl = trades.reduce((sum, t) => sum + t.pnl, 0);
+    const avgEdge = total > 0 ? trades.reduce((sum, t) => sum + t.edge, 0) / total : 0;
+    stratStats.push([
+      s,
+      total,
+      wins,
+      Math.round(wr * 100) / 100,
+      Math.round(pnl * 100) / 100,
+      Math.round(avgEdge * 10000) / 10000,
+    ]);
+  }
+  // Sort by Win Rate % descending, strategies with < 30 trades at the bottom
+  stratStats.sort((a, b) => {
+    if (a[1] < 30 && b[1] >= 30) return 1;
+    if (b[1] < 30 && a[1] >= 30) return -1;
+    return b[3] - a[3];
+  });
+  for (const row of stratStats) {
+    leftRows.push(row);
+  }
+
+  leftRows.push([]);
+
+  // ── Combinations (pairs, triples, quadruples) ─────────────────────────
+  // Only use strategies with at least 5 resolved trades for combinations
+  const comboStrats = activeStrats.filter(s => Object.keys(stratData[s]).length >= 5);
+
+  if (comboStrats.length >= 2) {
+    leftRows.push(['🏆 COMBINATIONS (Unanimous consensus)']);
+    leftRows.push(['Combination', 'Size', 'Epochs', 'Wins', 'Win Rate %', 'PnL ($15/trade)', 'Better?']);
+
+    // Generate all pairs, triples, quadruples
+    const combos = [];
+    const maxSize = Math.min(5, comboStrats.length);
+
+    function generateCombos(start, current) {
+      if (current.length >= 2 && current.length <= maxSize) {
+        combos.push([...current]);
+      }
+      if (current.length >= maxSize) return;
+      for (let i = start; i < comboStrats.length; i++) {
+        current.push(comboStrats[i]);
+        generateCombos(i + 1, current);
+        current.pop();
+      }
+    }
+    generateCombos(0, []);
+
+    // Evaluate each combination
+    const comboResults = [];
+    for (const combo of combos) {
+      let epochs = 0;
+      let wins = 0;
+      for (const epoch of sortedEpochs) {
+        // Check if ALL strategies in combo voted on this epoch
+        const votes = combo.map(s => stratData[s]?.[epoch]?.side).filter(Boolean);
+        if (votes.length !== combo.length) continue;
+        // Check unanimous
+        const allUp = votes.every(v => v === 'UP');
+        const allDown = votes.every(v => v === 'DOWN');
+        if (!allUp && !allDown) continue;
+
+        // Determine actual
+        let actual = '';
+        for (const s of activeStrats) {
+          const d = stratData[s]?.[epoch];
+          if (d?.open > 0 && d?.close > 0) { actual = d.close > d.open ? 'UP' : 'DOWN'; break; }
+        }
+        if (!actual) continue;
+
+        epochs++;
+        const consensusSide = allUp ? 'UP' : 'DOWN';
+        if (consensusSide === actual) wins++;
+      }
+
+      const wr = epochs > 0 ? (wins / epochs * 100) : 0;
+      const pnl = wins * 15 - (epochs - wins) * 15;
+      const better = wr > 52 ? '✅ YES' : (wr >= 48 ? '➖ ~50/50' : '❌ NO');
+
+      comboResults.push({
+        name: combo.join('+'),
+        size: combo.length,
+        epochs,
+        wins,
+        wr: Math.round(wr * 100) / 100,
+        pnl: Math.round(pnl * 100) / 100,
+        better,
+      });
+    }
+
+    // Sort: best win rate first (min 3 epochs to be meaningful)
+    comboResults.sort((a, b) => {
+      if (a.epochs < 30 && b.epochs >= 30) return 1;
+      if (b.epochs < 30 && a.epochs >= 30) return -1;
+      return b.wr - a.wr;
+    });
+
+    for (const c of comboResults) {
+      leftRows.push([c.name, c.size, c.epochs, c.wins, c.wr, c.pnl, c.better]);
+    }
+  }
+
+  // ── Write everything ──────────────────────────────────────────────────
+  // Clear both sides
   await sheets.spreadsheets.values.clear({
     spreadsheetId: SSID,
-    range: `'${stratTab}'!J1:Z6000`,
+    range: `'${stratTab}'!A1:H500`,
   });
+  await sheets.spreadsheets.values.clear({
+    spreadsheetId: SSID,
+    range: `'${stratTab}'!J1:AZ6000`,
+  });
+
+  // Write left side (stats + combos)
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SSID,
+    range: `'${stratTab}'!A1`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: leftRows },
+  });
+
+  // Write right side (epoch map)
   await sheets.spreadsheets.values.update({
     spreadsheetId: SSID,
     range: `'${stratTab}'!J1`,
@@ -205,7 +541,7 @@ async function refreshEpochMap(sheets, existingTabs) {
     requestBody: { values: epRows },
   });
 
-  console.log(`  ✅ Epoch Map refreshed: ${sortedEpochs.length} epochs`);
+  console.log(`  ✅ Cross-Strategy refreshed: ${sortedEpochs.length} epochs, ${activeStrats.length} strategies, ${leftRows.length - 7} combinations`);
 }
 
 main().catch(e => {
