@@ -34,10 +34,30 @@ class BaseStrategy(ABC):
         self.max_bet_share_of_side = pcfg.get("max_bet_share_of_side", 0.25)
         self.pancake_fee = pcfg.get("fee", 0.03)
 
+        # Prefetch cache: keyed by epoch, cleared on new epoch
+        self._prefetch_epoch: Optional[int] = None
+        self._prefetch_cache: dict = {}
+
     def update_bankroll(self, new_bankroll: float):
         """Update the current bankroll after PnL changes."""
         self.bankroll = new_bankroll
         self.last_skip_reason = None
+
+    def prefetch(self, prices: list[float], epoch: Optional[int] = None) -> None:
+        """
+        Pre-fetch slow external data (API calls, RPC calls) before the sniper window.
+
+        Called during Phase 1 (T-15s → T-8s before lock) to warm up caches.
+        Default implementation invalidates the cache for the new epoch and does nothing.
+        Override in strategies that make external API calls.
+
+        Args:
+            prices: Current price series (may be used for context/filtering).
+            epoch: Current epoch number (used for cache invalidation).
+        """
+        if epoch is not None and epoch != self._prefetch_epoch:
+            self._prefetch_epoch = epoch
+            self._prefetch_cache.clear()
 
     @abstractmethod
     def evaluate(
