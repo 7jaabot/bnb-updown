@@ -205,6 +205,14 @@ class LiveTrader:
         self._trade_counter = 0
         self._pancake_client = None  # Set externally by PolymarketBot
 
+        # Sniper pre-signed transactions (Phase 1/2)
+        self._prepared_txs: dict = {}
+        self._prepared_epoch: Optional[int] = None
+        self._last_fired_tx_hash: Optional[str] = None
+        self._last_fired_side: Optional[str] = None
+        self._last_fired_epoch: Optional[int] = None
+        self._last_fired_bet_bnb: Optional[float] = None
+
         # Load .env and init
         self._load_env()
         self._init_web3()
@@ -380,6 +388,147 @@ class LiveTrader:
                         pass
 
         return None
+
+    # ─── Sniper Transaction Methods ──────────────────────────────────────────
+
+    def prepare_transactions(self, epoch: int, bet_bnb: float) -> bool:
+        """
+        Phase 1 (pre-load): Pre-build and pre-sign BOTH bull and bear transactions.
+
+        Stores them in self._prepared_txs dict keyed by "YES" and "NO".
+        Call fire_transaction(side) to broadcast the chosen one.
+
+        Args:
+            epoch: Current PancakeSwap epoch.
+            bet_bnb: Amount of BNB to wager.
+
+        Returns:
+            True if both transactions were successfully prepared, False otherwise.
+        """
+        if not self._w3 or not self._account or not self._contract:
+            logger.error("prepare_transactions: Web3 not initialized")
+            return False
+
+        bet_wei = int(bet_bnb * 1e18)
+        if bet_wei <= 0:
+            logger.error(f"prepare_transactions: invalid bet_bnb={bet_bnb}")
+            return False
+
+        gas_price = self._estimate_gas_price()
+        nonce = self._w3.eth.get_transaction_count(self._wallet_address)
+
+        prepared = {}
+        for side, fn_name in [("YES", "betBull"), ("NO", "betBear")]:
+            fn = getattr(self._contract.functions, fn_name)(epoch)
+            try:
+                gas_estimate = fn.estimate_gas({
+                    "from": self._wallet_address,
+                    "value": bet_wei,
+                })
+                gas_limit = int(gas_estimate * 1.2)
+            except Exception as e:
+                logger.warning(f"prepare_transactions: gas estimate failed for {fn_name}: {e} — using 200000")
+                gas_limit = 200_000
+
+            tx = fn.build_transaction({
+                "from": self._wallet_address,
+                "value": bet_wei,
+                "gas": gas_limit,
+                "gasPrice": gas_price,
+                "nonce": nonce,
+                "chainId": 56,
+            })
+
+            try:
+                signed = self._account.sign_transaction(tx)
+                prepared[side] = {
+                    "tx": tx,
+                    "signed": signed,
+                    "epoch": epoch,
+                    "bet_bnb": bet_bnb,
+                    "nonce": nonce,
+                }
+                logger.debug(f"prepare_transactions: {fn_name}(epoch={epoch}) pre-signed | bet={bet_bnb:.6f} BNB")
+            except Exception as e:
+                logger.error(f"prepare_transactions: signing failed for {fn_name}: {e}")
+                return False
+
+        self._prepared_txs = prepared
+        self._prepared_epoch = epoch
+        logger.info(
+            f"💡 Both transactions pre-signed for epoch {epoch} | "
+            f"bet={bet_bnb:.6f} BNB | gas_price={gas_price / 1e9:.1f} Gwei"
+        )
+        return True
+
+    def fire_transaction(self, side: str) -> Optional[str]:
+        """
+        Phase 2 (sniper): Fire the pre-signed transaction immediately (fire-and-forget).
+
+        Does NOT wait for receipt — returns the tx hash immediately.
+        Call verify_transaction() after lock to check confirmation.
+
+        Args:
+            side: "YES" (bull) or "NO" (bear).
+
+        Returns:
+            Transaction hash hex string, or None on failure.
+        """
+        if not hasattr(self, '_prepared_txs') or side not in self._prepared_txs:
+            logger.error(f"fire_transaction: no pre-signed TX for side={side} — falling back to fresh TX")
+            return None
+
+        prepared = self._prepared_txs[side]
+        signed = prepared["signed"]
+
+        try:
+            tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
+            tx_hash_hex = tx_hash.hex()
+            self._last_fired_tx_hash = tx_hash_hex
+            self._last_fired_side = side
+            self._last_fired_epoch = prepared["epoch"]
+            self._last_fired_bet_bnb = prepared["bet_bnb"]
+
+            fn_name = "betBull" if side == "YES" else "betBear"
+            logger.info(
+                f"🚀 FIRED {fn_name}(epoch={prepared['epoch']}) — "
+                f"tx={tx_hash_hex} | bet={prepared['bet_bnb']:.6f} BNB"
+            )
+            return tx_hash_hex
+
+        except Exception as e:
+            logger.error(f"fire_transaction: send failed for side={side}: {e}")
+            return None
+
+    def verify_transaction(self, timeout: int = 30) -> Optional[bool]:
+        """
+        Phase 3 (verify): Check if the last fired transaction was confirmed.
+
+        Args:
+            timeout: Seconds to wait for receipt.
+
+        Returns:
+            True if confirmed, False if failed, None if not yet mined.
+        """
+        tx_hash_hex = getattr(self, '_last_fired_tx_hash', None)
+        if not tx_hash_hex:
+            logger.warning("verify_transaction: no fired TX to verify")
+            return None
+
+        try:
+            receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash_hex, timeout=timeout)
+            if receipt.status == 1:
+                logger.info(
+                    f"✅ Transaction confirmed: {tx_hash_hex} | "
+                    f"block={receipt.blockNumber}"
+                )
+                return True
+            else:
+                logger.error(f"❌ Transaction FAILED on-chain: {tx_hash_hex}")
+                return False
+        except Exception as e:
+            logger.warning(f"verify_transaction: receipt not yet available ({e})")
+            return None
 
     # ─── Core Interface (mirrors PaperTrader) ────────────────────────────────
 
