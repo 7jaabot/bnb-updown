@@ -117,9 +117,12 @@ async function main() {
     console.log(`  ✅ ${actualTab}: ${rows.length - 1} trades synced`);
   }
 
-  // Refresh all analysis tabs
+  // Refresh all analysis tabs (add delays to avoid write quota)
+  await sleep(2000);
   await refreshEpochMap(sheets, existingTabs);
+  await sleep(2000);
   await refreshStrategyComparison(sheets, existingTabs);
+  await sleep(2000);
   await refreshDeepEdge(sheets, existingTabs);
 
   console.log('Done.');
@@ -378,6 +381,7 @@ async function refreshDeepEdge(sheets, existingTabs) {
 // ── Helpers ──────────────────────────────────────────────────────────────
 function r2(n) { return Math.round(n * 100) / 100; }
 function r4(n) { return Math.round(n * 10000) / 10000; }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function refreshEpochMap(sheets, existingTabs) {
   const SSID = SPREADSHEET_ID;
@@ -506,12 +510,14 @@ async function refreshEpochMap(sheets, existingTabs) {
   // Only use strategies with at least 5 resolved trades for combinations
   const comboStrats = activeStrats.filter(s => Object.keys(stratData[s]).length >= 5);
 
+  // Generate all pairs, triples, quadruples (hoisted for reuse in optimized block)
+  const combos = [];
+  const comboResults = [];
+
   if (comboStrats.length >= 2) {
     leftRows.push(['🏆 COMBINATIONS (Unanimous consensus)']);
     leftRows.push(['Combination', 'Size', 'Epochs', 'Wins', 'Win Rate %', 'PnL ($15/trade)', 'Better?']);
 
-    // Generate all pairs, triples, quadruples
-    const combos = [];
     const maxSize = Math.min(5, comboStrats.length);
 
     function generateCombos(start, current) {
@@ -528,7 +534,6 @@ async function refreshEpochMap(sheets, existingTabs) {
     generateCombos(0, []);
 
     // Evaluate each combination
-    const comboResults = [];
     for (const combo of combos) {
       let epochs = 0;
       let wins = 0;
@@ -570,14 +575,118 @@ async function refreshEpochMap(sheets, existingTabs) {
     }
 
     // Sort: best win rate first (min 3 epochs to be meaningful)
-    comboResults.sort((a, b) => {
+    const sortedComboResults = [...comboResults].sort((a, b) => {
       if (a.epochs < 30 && b.epochs >= 30) return 1;
       if (b.epochs < 30 && a.epochs >= 30) return -1;
       return b.wr - a.wr;
     });
 
-    for (const c of comboResults) {
+    for (const c of sortedComboResults) {
       leftRows.push([c.name, c.size, c.epochs, c.wins, c.wr, c.pnl, c.better]);
+    }
+  }
+
+  // ── Compute profitable edge buckets per strategy ─────────────────────
+  // Buckets: [0-0.05], [0.05-0.10], [0.10-0.15], [0.15-0.20], [0.20-0.30], [0.30+]
+  const edgeBuckets = [[0, 0.05], [0.05, 0.10], [0.10, 0.15], [0.15, 0.20], [0.20, 0.30], [0.30, 1.0]];
+  function bucketLabel(lo, hi) {
+    return hi >= 1.0 ? `${lo.toFixed(2)}+` : `${lo.toFixed(2)}-${hi.toFixed(2)}`;
+  }
+  function stratAbbrev(s) {
+    return s.split('_').map(w => w[0] ? w[0].toUpperCase() : '').join('');
+  }
+
+  const profitableBuckets = {}; // { stratName: [[lo, hi], ...] }
+  for (const s of activeStrats) {
+    const trades = Object.values(stratData[s]);
+    profitableBuckets[s] = [];
+    for (const [lo, hi] of edgeBuckets) {
+      const bucket = trades.filter(t => t.edge >= lo && t.edge < hi);
+      const bWins = bucket.filter(t => t.outcome === 'WIN').length;
+      if (bucket.length >= 5 && bWins / bucket.length > 0.5) {
+        profitableBuckets[s].push([lo, hi]);
+      }
+    }
+  }
+
+  // ── 🎯 Optimized Combinations block ──────────────────────────────────
+  // Align vertically with the 🏆 block — pad with empty rows to match
+  const comboStartRow = leftRows.length - (comboResults.length > 0 ? comboResults.length + 2 : 0);
+  const optComboRows = [];
+  // Pad to align with 🏆 block start row
+  for (let i = 0; i < comboStartRow; i++) {
+    optComboRows.push([]);
+  }
+  optComboRows.push(['🎯 OPTIMIZED COMBINATIONS (edge-filtered consensus)']);
+  optComboRows.push(['Combination', 'Size', 'Epochs', 'Wins', 'Win Rate %', 'PnL ($15/trade)', 'Better?', 'Brute WR%', 'Edge Filter Used']);
+
+  // Only use strategies that have at least one profitable bucket
+  const optEligibleStrats = comboStrats.filter(s => profitableBuckets[s] && profitableBuckets[s].length > 0);
+
+  const optComboResults = [];
+  for (const combo of combos) {
+    // All strategies in combo must have profitable buckets
+    if (!combo.every(s => optEligibleStrats.includes(s))) continue;
+
+    let optEpochs = 0, optWins = 0;
+
+    for (const epoch of sortedEpochs) {
+      const votes = combo.map(s => stratData[s]?.[epoch]?.side).filter(Boolean);
+      if (votes.length !== combo.length) continue;
+      const allUp = votes.every(v => v === 'UP');
+      const allDown = votes.every(v => v === 'DOWN');
+      if (!allUp && !allDown) continue;
+
+      // Check each strategy's edge was in one of its profitable buckets
+      const allInProfitable = combo.every(s => {
+        const edge = stratData[s]?.[epoch]?.edge;
+        if (edge === undefined || edge === null) return false;
+        return profitableBuckets[s].some(([lo, hi]) => edge >= lo && edge < hi);
+      });
+      if (!allInProfitable) continue;
+
+      let actual = '';
+      for (const s of activeStrats) {
+        const d = stratData[s]?.[epoch];
+        if (d?.open > 0 && d?.close > 0) { actual = d.close > d.open ? 'UP' : 'DOWN'; break; }
+      }
+      if (!actual) continue;
+
+      optEpochs++;
+      if ((allUp ? 'UP' : 'DOWN') === actual) optWins++;
+    }
+
+    if (optEpochs < 5) continue; // min 5 epochs (accumulation phase)
+
+    const optWr = r2(optEpochs > 0 ? (optWins / optEpochs * 100) : 0);
+    const optPnl = r2(optWins * 15 - (optEpochs - optWins) * 15);
+
+    // Brute WR from comboResults
+    const brute = comboResults.find(c => c.name === combo.join('+'));
+    const bruteWr = brute ? brute.wr : 'N/A';
+
+    // Build filter description
+    const filterUsed = combo.map(s => {
+      const labels = profitableBuckets[s].map(([lo, hi]) => bucketLabel(lo, hi)).join(',');
+      return `${stratAbbrev(s)}:[${labels}]`;
+    }).join(' ');
+
+    const optBetter = optWr > 52 ? '✅ YES' : (optWr >= 48 ? '➖ ~50/50' : '❌ NO');
+    optComboResults.push({ name: combo.join('+'), size: combo.length, epochs: optEpochs, wins: optWins, wr: optWr, pnl: optPnl, better: optBetter, bruteWr, filterUsed });
+  }
+
+  // Sort by WR descending
+    optComboResults.sort((a, b) => {
+    if (a.epochs < 30 && b.epochs >= 30) return 1;
+    if (b.epochs < 30 && a.epochs >= 30) return -1;
+    return b.wr - a.wr;
+  });
+
+  if (optComboResults.length === 0) {
+    optComboRows.push(['Not enough data for optimized combinations']);
+  } else {
+    for (const c of optComboResults) {
+      optComboRows.push([c.name, c.size, c.epochs, c.wins, c.wr, c.pnl, c.better, c.bruteWr, c.filterUsed]);
     }
   }
 
@@ -589,26 +698,36 @@ async function refreshEpochMap(sheets, existingTabs) {
   });
   await sheets.spreadsheets.values.clear({
     spreadsheetId: SSID,
-    range: `'${stratTab}'!J1:AZ6000`,
+    range: `'${stratTab}'!I1:AZ6000`,
   });
 
-  // Write left side (stats + combos)
+  // Write left side (stats + combos) — unchanged
   await sheets.spreadsheets.values.update({
     spreadsheetId: SSID,
     range: `'${stratTab}'!A1`,
     valueInputOption: 'USER_ENTERED',
     requestBody: { values: leftRows },
   });
+  await sleep(1200);
 
-  // Write right side (epoch map)
+  // Write 🎯 Optimized Combinations block starting at column I (next to 🏆 block)
   await sheets.spreadsheets.values.update({
     spreadsheetId: SSID,
-    range: `'${stratTab}'!J1`,
+    range: `'${stratTab}'!I1`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: optComboRows },
+  });
+  await sleep(1200);
+
+  // Write epoch map starting at column T (shifted right)
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SSID,
+    range: `'${stratTab}'!T1`,
     valueInputOption: 'USER_ENTERED',
     requestBody: { values: epRows },
   });
 
-  console.log(`  ✅ Cross-Strategy refreshed: ${sortedEpochs.length} epochs, ${activeStrats.length} strategies, ${leftRows.length - 7} combinations`);
+  console.log(`  ✅ Cross-Strategy refreshed: ${sortedEpochs.length} epochs, ${activeStrats.length} strategies, ${optComboResults.length} optimized combos`);
 }
 
 main().catch(e => {
