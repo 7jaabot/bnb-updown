@@ -259,8 +259,13 @@ class LLMPriceActionStrategy(BaseStrategy):
             }
 
         except req_lib.exceptions.HTTPError as e:
-            body = e.response.text[:200] if e.response else ""
-            logger.error(f"[LLM] Groq API HTTP {e.response.status_code if e.response else '?'}: {body}")
+            status = e.response.status_code if e.response is not None else "?"
+            body = e.response.text[:200] if e.response is not None else str(e)
+            logger.error(f"[LLM] Groq API HTTP {status}: {body}")
+        except req_lib.exceptions.ConnectionError as e:
+            logger.error(f"[LLM] Groq connection error: {e}")
+        except req_lib.exceptions.Timeout as e:
+            logger.error(f"[LLM] Groq timeout: {e}")
         except json.JSONDecodeError as e:
             logger.error(f"[LLM] Failed to parse LLM response as JSON: {e}")
         except Exception as e:

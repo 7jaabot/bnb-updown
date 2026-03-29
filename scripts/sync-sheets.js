@@ -221,21 +221,21 @@ async function refreshStrategyComparison(sheets, existingTabs) {
     const bestWr = eligible.reduce((b, r) => r[4] > b[4] ? r : b);
     const bestPnl = eligible.reduce((b, r) => r[5] > b[5] ? r : b);
     const worstPnl = eligible.reduce((b, r) => r[5] < b[5] ? r : b);
-    outputRows.push(['🥇 Best Win Rate (min 30)', bestWr[0], bestWr[4]]);
-    outputRows.push(['🥇 Best PnL (min 30)', bestPnl[0], bestPnl[5]]);
-    outputRows.push(['❌ Worst PnL (min 30)', worstPnl[0], worstPnl[5]]);
+    outputRows.push(['🥇 Best Win Rate (min 30)', bestWr[0], bestWr[4] + '%']);
+    outputRows.push(['🥇 Best PnL (min 30)', bestPnl[0], '$' + bestPnl[5]]);
+    outputRows.push(['❌ Worst PnL (min 30)', worstPnl[0], '$' + worstPnl[5]]);
   } else {
     outputRows.push(['🥇 Best Win Rate (min 30)', 'Not enough data']);
     outputRows.push(['🥇 Best PnL (min 30)', 'Not enough data']);
     outputRows.push(['❌ Worst PnL (min 30)', 'Not enough data']);
   }
   const worstAll = results.length > 0 ? results.reduce((b, r) => r[5] < b[5] ? r : b) : null;
-  outputRows.push(['❌ Worst PnL ($)', worstAll ? worstAll[0] : 'N/A', worstAll ? worstAll[5] : 'N/A']);
+  outputRows.push(['❌ Worst PnL ($)', worstAll ? worstAll[0] : 'N/A', worstAll ? '$' + worstAll[5] : 'N/A']);
 
   await sheets.spreadsheets.values.clear({ spreadsheetId: SSID, range: `'${tab}'!A1:P50` });
   await sheets.spreadsheets.values.update({
     spreadsheetId: SSID, range: `'${tab}'!A1`,
-    valueInputOption: 'RAW',
+    valueInputOption: 'USER_ENTERED',
     requestBody: { values: outputRows },
   });
 
@@ -311,7 +311,7 @@ async function refreshDeepEdge(sheets, existingTabs) {
   await sheets.spreadsheets.values.clear({ spreadsheetId: SSID, range: `'${tab}'!A1:G300` });
   await sheets.spreadsheets.values.update({
     spreadsheetId: SSID, range: `'${tab}'!A1`,
-    valueInputOption: 'RAW',
+    valueInputOption: 'USER_ENTERED',
     requestBody: { values: allRows },
   });
 
@@ -529,7 +529,7 @@ async function refreshEpochMap(sheets, existingTabs) {
   await sheets.spreadsheets.values.update({
     spreadsheetId: SSID,
     range: `'${stratTab}'!A1`,
-    valueInputOption: 'RAW',
+    valueInputOption: 'USER_ENTERED',
     requestBody: { values: leftRows },
   });
 
@@ -537,7 +537,7 @@ async function refreshEpochMap(sheets, existingTabs) {
   await sheets.spreadsheets.values.update({
     spreadsheetId: SSID,
     range: `'${stratTab}'!J1`,
-    valueInputOption: 'RAW',
+    valueInputOption: 'USER_ENTERED',
     requestBody: { values: epRows },
   });
 

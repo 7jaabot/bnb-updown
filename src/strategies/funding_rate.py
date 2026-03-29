@@ -133,6 +133,13 @@ class FundingRateStrategy(BaseStrategy):
                 raw = resp.read().decode("utf-8")
                 data = json.loads(raw)
 
+            # Binance sometimes returns a list with one element instead of a dict
+            if isinstance(data, list):
+                if len(data) > 0 and isinstance(data[0], dict):
+                    data = data[0]
+                else:
+                    logger.warning(f"Unexpected premiumIndex list response: {data}")
+                    return None
             if not isinstance(data, dict):
                 logger.warning(f"Unexpected premiumIndex response type: {type(data)}")
                 return None

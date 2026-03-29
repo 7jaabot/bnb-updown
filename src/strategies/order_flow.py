@@ -87,6 +87,7 @@ class OrderFlowStrategy(BaseStrategy):
             self._prefetch_cache["ofi"] = ofi
             self._prefetch_cache["total_volume"] = total_volume
             self._prefetch_cache["buy_ratio"] = buy_ratio
+            self._prefetch_cache["n_trades"] = len(trades)
             logger.info(
                 f"OFI prefetch: {len(trades)} trades | OFI={ofi:+.4f} | "
                 f"buy_ratio={buy_ratio:.3f} | total_notional={total_volume:.1f} USDT"
@@ -184,10 +185,12 @@ class OrderFlowStrategy(BaseStrategy):
             return None
 
         # ── Fetch order flow data (use prefetch cache if available) ────────────
+        n_trades = 0
         if "ofi" in self._prefetch_cache:
             ofi = self._prefetch_cache["ofi"]
             total_volume = self._prefetch_cache.get("total_volume", 0.0)
             buy_ratio = self._prefetch_cache.get("buy_ratio", 0.5)
+            n_trades = self._prefetch_cache.get("n_trades", 0)
             logger.debug(f"OFI: using prefetched data | OFI={ofi:+.4f}")
         else:
             trades = self._fetch_agg_trades()
@@ -195,6 +198,7 @@ class OrderFlowStrategy(BaseStrategy):
                 self.last_skip_reason = "⏸ OFI: no aggTrades data available"
                 logger.warning("OFI: skipping — no trades fetched")
                 return None
+            n_trades = len(trades)
             ofi, total_volume, buy_ratio = self._compute_ofi(trades)
 
         # Convert USDT notional volume to approximate BNB for min_volume check
@@ -205,7 +209,7 @@ class OrderFlowStrategy(BaseStrategy):
             total_bnb = 0.0
 
         logger.info(
-            f"OFI: {len(trades)} trades | OFI={ofi:+.4f} | "
+            f"OFI: {n_trades} trades | OFI={ofi:+.4f} | "
             f"buy_ratio={buy_ratio:.3f} | total_notional={total_volume:.1f} USDT "
             f"(≈{total_bnb:.1f} BNB) | threshold={self.ofi_threshold}"
         )
