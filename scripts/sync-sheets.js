@@ -137,18 +137,26 @@ async function refreshStrategyComparison(sheets, existingTabs) {
   const tab = existingTabs.find(t => t.includes('Strategy Comparison'));
   if (!tab) { console.log('  ⏸ Strategy Comparison tab not found'); return; }
 
+  // Global drift/timing accumulators
+  let globalDriftSum = 0, globalDriftCount = 0;
+  let globalDrift5Count = 0, globalDrift10Count = 0;
+  let globalTimingSum = 0, globalTimingCount = 0;
+
   // Load all trade data
   const results = [];
   for (const s of STRATS) {
     const actualTab = existingTabs.find(t => t.toLowerCase() === s.toLowerCase()) || s;
     try {
-      const res = await sheets.spreadsheets.values.get({ spreadsheetId: SSID, range: `'${actualTab}'!A1:V5000` });
+      const res = await sheets.spreadsheets.values.get({ spreadsheetId: SSID, range: `'${actualTab}'!A1:Z5000` });
       const rows = res.data.values || [];
       if (rows.length < 2) continue;
       const h = rows[0];
       const iSide = h.indexOf('side_label'), iOutcome = h.indexOf('outcome');
       const iEdge = h.indexOf('edge_at_entry'), iPnl = h.indexOf('pnl_usdc');
       const iPos = h.indexOf('position_size_usdc'), iPayout = h.indexOf('payout_per_share');
+      const iDrift = h.indexOf('pool_drift_pct');
+      const iEntryTs = h.indexOf('timestamp_entry');
+      const iWindowEnd = h.indexOf('window_end_ts');
 
       const trades = [];
       for (let i = 1; i < rows.length; i++) {
@@ -162,6 +170,9 @@ async function refreshStrategyComparison(sheets, existingTabs) {
           pnl: parseFloat(r[iPnl]) || 0,
           pos: parseFloat(r[iPos]) || 0,
           payout: parseFloat(r[iPayout]) || 0,
+          drift: iDrift >= 0 ? (parseFloat(r[iDrift]) || 0) : -1,
+          entryTs: iEntryTs >= 0 ? (parseFloat(r[iEntryTs]) || 0) : 0,
+          windowEnd: iWindowEnd >= 0 ? (parseFloat(r[iWindowEnd]) || 0) : 0,
         });
       }
       if (trades.length === 0) continue;
@@ -182,26 +193,71 @@ async function refreshStrategyComparison(sheets, existingTabs) {
       const wagered = trades.reduce((s, t) => s + t.pos, 0);
       const roi = wagered > 0 ? pnl / wagered * 100 : 0;
 
+      // Drift stats — only trades where drift > 0 (data available)
+      const driftTrades = iDrift >= 0 ? trades.filter(t => t.drift > 0) : [];
+      const hasDrift = driftTrades.length > 0;
+      const avgDrift = hasDrift ? r2(driftTrades.reduce((s, t) => s + t.drift, 0) / driftTrades.length * 100) : null;
+      const pctDrift5 = hasDrift ? r2(driftTrades.filter(t => t.drift > 0.05).length / driftTrades.length * 100) : null;
+      const pctDrift10 = hasDrift ? r2(driftTrades.filter(t => t.drift > 0.10).length / driftTrades.length * 100) : null;
+
+      // Accumulate global drift stats
+      if (hasDrift) {
+        globalDriftSum += driftTrades.reduce((s, t) => s + t.drift, 0);
+        globalDriftCount += driftTrades.length;
+        globalDrift5Count += driftTrades.filter(t => t.drift > 0.05).length;
+        globalDrift10Count += driftTrades.filter(t => t.drift > 0.10).length;
+      }
+
+      // Timing: seconds before lock (window_end_ts - timestamp_entry)
+      if (iEntryTs >= 0 && iWindowEnd >= 0) {
+        for (const t of trades) {
+          if (t.entryTs > 0 && t.windowEnd > 0) {
+            let diff = t.windowEnd - t.entryTs;
+            if (t.windowEnd > 1e10) diff = diff / 1000; // ms → s
+            if (diff > 0 && diff < 3600) {
+              globalTimingSum += diff;
+              globalTimingCount++;
+            }
+          }
+        }
+      }
+
       results.push([
         s, total, wins.length, losses.length,
         r2(wr), r2(pnl), r2(pnl / total), r4(avgEdge),
         upTrades.length, downTrades.length,
         r2(upWr), r2(downWr),
         r2(avgWinPnl), r2(avgLossPnl), r2(rr), r2(roi),
+        avgDrift !== null ? avgDrift : 'N/A',
+        pctDrift5 !== null ? pctDrift5 : 'N/A',
+        pctDrift10 !== null ? pctDrift10 : 'N/A',
       ]);
     } catch(e) {
       console.log(`  ⚠️ Comparison: could not load ${s}: ${e.message}`);
     }
   }
 
+  // Build trading quality block (global)
+  const globalAvgDrift = globalDriftCount > 0 ? r2(globalDriftSum / globalDriftCount * 100) + '%' : 'N/A';
+  const globalPctDrift5 = globalDriftCount > 0 ? r2(globalDrift5Count / globalDriftCount * 100) + '%' : 'N/A';
+  const globalPctDrift10 = globalDriftCount > 0 ? r2(globalDrift10Count / globalDriftCount * 100) + '%' : 'N/A';
+  const globalAvgTiming = globalTimingCount > 0 ? r2(globalTimingSum / globalTimingCount) + 's' : 'N/A';
+
   const n = results.length;
   const outputRows = [
+    ['📊 TRADING QUALITY (global)'],
+    ['Avg Pool Drift:', globalAvgDrift],
+    ['Trades with drift >5%:', globalPctDrift5],
+    ['Trades with drift >10%:', globalPctDrift10],
+    ['Avg seconds before lock:', globalAvgTiming],
+    [],
     [`🏆 Strategy Comparison — ${n} Strategies`],
     ['WIN+LOSS only. Updated hourly by sync script.'],
     [],
     ['Strategy', 'Trades (W+L)', 'Wins', 'Losses', 'Win Rate %', 'Total PnL ($)',
      'Avg PnL/Trade ($)', 'Avg Edge', 'UP Trades', 'DOWN Trades', 'UP WR %', 'DOWN WR %',
-     'Avg WIN PnL ($)', 'Avg LOSS PnL ($)', 'R/R Ratio', 'ROI %'],
+     'Avg WIN PnL ($)', 'Avg LOSS PnL ($)', 'R/R Ratio', 'ROI %',
+     'Avg Drift %', 'Drift >5%', 'Drift >10%'],
     ...results,
     [],
     ['📊 COMBINED'],
@@ -232,7 +288,7 @@ async function refreshStrategyComparison(sheets, existingTabs) {
   const worstAll = results.length > 0 ? results.reduce((b, r) => r[5] < b[5] ? r : b) : null;
   outputRows.push(['❌ Worst PnL ($)', worstAll ? worstAll[0] : 'N/A', worstAll ? '$' + worstAll[5] : 'N/A']);
 
-  await sheets.spreadsheets.values.clear({ spreadsheetId: SSID, range: `'${tab}'!A1:P50` });
+  await sheets.spreadsheets.values.clear({ spreadsheetId: SSID, range: `'${tab}'!A1:S70` });
   await sheets.spreadsheets.values.update({
     spreadsheetId: SSID, range: `'${tab}'!A1`,
     valueInputOption: 'USER_ENTERED',
@@ -261,7 +317,7 @@ async function refreshDeepEdge(sheets, existingTabs) {
   for (const s of STRATS) {
     const actualTab = existingTabs.find(t => t.toLowerCase() === s.toLowerCase()) || s;
     try {
-      const res = await sheets.spreadsheets.values.get({ spreadsheetId: SSID, range: `'${actualTab}'!A1:V5000` });
+      const res = await sheets.spreadsheets.values.get({ spreadsheetId: SSID, range: `'${actualTab}'!A1:Z5000` });
       const rows = res.data.values || [];
       if (rows.length < 2) continue;
       const h = rows[0];
@@ -337,12 +393,13 @@ async function refreshEpochMap(sheets, existingTabs) {
   }
 
   // ── Load resolved trades per strategy ─────────────────────────────────
-  const stratData = {};   // { stratName: { epoch: { side, open, close, edge, pnl } } }
+  const stratData = {};   // { stratName: { epoch: { side, open, close, edge, pnl, drift } } }
+  const stratHasDrift = {};  // { stratName: boolean }
   const allEpochs = new Set();
   for (const s of STRATS) {
     const actualTab = existingTabs.find(t => t.toLowerCase() === s.toLowerCase()) || s;
     try {
-      const res = await sheets.spreadsheets.values.get({ spreadsheetId: SSID, range: `'${actualTab}'!A1:V5000` });
+      const res = await sheets.spreadsheets.values.get({ spreadsheetId: SSID, range: `'${actualTab}'!A1:Z5000` });
       const rows = res.data.values || [];
       if (rows.length < 2) continue;
       const headers = rows[0];
@@ -353,6 +410,8 @@ async function refreshEpochMap(sheets, existingTabs) {
       const closeIdx = headers.indexOf('bnb_close');
       const edgeIdx = headers.indexOf('edge_at_entry');
       const pnlIdx = headers.indexOf('pnl_usdc');
+      const driftIdx = headers.indexOf('pool_drift_pct');
+      stratHasDrift[s] = driftIdx >= 0;
       stratData[s] = {};
       for (let i = 1; i < rows.length; i++) {
         const r = rows[i];
@@ -368,6 +427,7 @@ async function refreshEpochMap(sheets, existingTabs) {
           close: parseFloat(r[closeIdx]) || 0,
           edge: parseFloat(r[edgeIdx]) || 0,
           pnl: parseFloat(r[pnlIdx]) || 0,
+          drift: driftIdx >= 0 ? (parseFloat(r[driftIdx]) || 0) : null,
         };
       }
     } catch(e) {
@@ -379,9 +439,10 @@ async function refreshEpochMap(sheets, existingTabs) {
   const activeStrats = STRATS.filter(s => stratData[s] && Object.keys(stratData[s]).length > 0);
 
   // ── RIGHT SIDE: Epoch Map (J:...) ─────────────────────────────────────
+  const driftCols = activeStrats.map(s => `${s}_drift`);
   const epRows = [
-    ['═══ EPOCH MAP (refreshed hourly) ═══', ...Array(activeStrats.length).fill('')],
-    ['Epoch', ...activeStrats, 'Actual', 'UP votes', 'DOWN votes'],
+    ['═══ EPOCH MAP (refreshed hourly) ═══', ...Array(activeStrats.length + driftCols.length).fill('')],
+    ['Epoch', ...activeStrats, 'Actual', 'UP votes', 'DOWN votes', ...driftCols],
   ];
   for (const epoch of sortedEpochs) {
     const sides = activeStrats.map(s => stratData[s]?.[epoch]?.side || '');
@@ -392,7 +453,13 @@ async function refreshEpochMap(sheets, existingTabs) {
     }
     const upVotes = sides.filter(s => s === 'UP').length;
     const downVotes = sides.filter(s => s === 'DOWN').length;
-    epRows.push([epoch, ...sides, actual, upVotes, downVotes]);
+    const driftVals = activeStrats.map(s => {
+      if (!stratHasDrift[s]) return '';
+      const d = stratData[s]?.[epoch];
+      if (!d || d.drift === null || d.drift === 0) return '';
+      return r2(d.drift * 100);
+    });
+    epRows.push([epoch, ...sides, actual, upVotes, downVotes, ...driftVals]);
   }
 
   // ── LEFT SIDE: Per-Strategy Stats + Combinations (A:H) ───────────────
