@@ -142,65 +142,112 @@ class TestKellyFraction:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestComputePositionSize:
-    def test_yes_trade_size(self):
+    def test_flat_size_returned(self):
+        """Flat position size should be returned unchanged when within guards."""
         raw_k, size = compute_position_size(
             edge=0.10,
             p_up=0.65,
             side="YES",
             yes_price=0.55,
             bankroll=1000.0,
-            kelly_fraction_cap=0.25,
-            max_usdc=50.0,
+            position_size_usdc=10.0,
         )
-        assert raw_k > 0
-        assert size > 0
-        assert size <= 50.0
+        assert raw_k == 0.0       # kelly_fraction always 0.0 now
+        assert size == pytest.approx(10.0)
 
-    def test_no_trade_size(self):
+    def test_no_side_flat_size(self):
+        """Flat sizing works regardless of side."""
         raw_k, size = compute_position_size(
             edge=0.15,
             p_up=0.40,
             side="NO",
             yes_price=0.55,
             bankroll=1000.0,
-            kelly_fraction_cap=0.25,
-            max_usdc=50.0,
+            position_size_usdc=10.0,
         )
-        assert size > 0
+        assert size == pytest.approx(10.0)
 
-    def test_max_cap_respected(self):
+    def test_max_bankroll_pct_cap(self):
+        """position should be capped at max_bankroll_pct × bankroll."""
+        _, size = compute_position_size(
+            edge=0.40,
+            p_up=0.90,
+            side="YES",
+            yes_price=0.50,
+            bankroll=50.0,               # 10% of 50 = 5 USDC < flat $10
+            position_size_usdc=10.0,
+            max_bankroll_pct=0.10,
+        )
+        assert size == pytest.approx(5.0)
+
+    def test_max_pool_pct_cap(self):
+        """position should be capped at max_pool_pct × pool_total_usdc."""
         _, size = compute_position_size(
             edge=0.40,
             p_up=0.90,
             side="YES",
             yes_price=0.50,
             bankroll=10000.0,
-            kelly_fraction_cap=0.25,
-            max_usdc=50.0,
+            position_size_usdc=10.0,
+            max_bankroll_pct=1.0,        # no bankroll cap
+            max_pool_pct=0.10,           # 10% of pool
+            pool_total_usdc=50.0,        # pool = 50 USDC → cap = 5 USDC
         )
-        assert size <= 50.0
+        assert size == pytest.approx(5.0)
 
-    def test_negative_edge_returns_zero(self):
-        raw_k, size = compute_position_size(
-            edge=0.0,
-            p_up=0.45,
-            side="NO",
-            yes_price=0.45,
-            bankroll=1000.0,
-            kelly_fraction_cap=0.25,
-            max_usdc=50.0,
-        )
-        assert size == 0.0
-
-    def test_zero_price_returns_zero(self):
-        raw_k, size = compute_position_size(
+    def test_min_usdc_skip_when_below(self):
+        """If position after caps < min_usdc, trade is skipped (returns 0)."""
+        _, size = compute_position_size(
             edge=0.10,
             p_up=0.60,
             side="YES",
-            yes_price=0.0,  # Invalid price
-            bankroll=1000.0,
+            yes_price=0.50,
+            bankroll=20.0,               # 10% of 20 = 2 USDC < min 5
+            position_size_usdc=10.0,
+            max_bankroll_pct=0.10,
+            min_usdc=5.0,
         )
-        assert size == 0.0
+        assert size == pytest.approx(0.0)
+
+    def test_min_usdc_not_skipped_when_above(self):
+        """Position >= min_usdc should be returned normally."""
+        _, size = compute_position_size(
+            edge=0.10,
+            p_up=0.60,
+            side="YES",
+            yes_price=0.50,
+            bankroll=1000.0,
+            position_size_usdc=10.0,
+            min_usdc=5.0,
+        )
+        assert size == pytest.approx(10.0)
+
+    def test_pool_total_zero_skips_pool_cap(self):
+        """When pool_total_usdc=0, pool% cap should not block the trade."""
+        _, size = compute_position_size(
+            edge=0.40,
+            p_up=0.90,
+            side="YES",
+            yes_price=0.50,
+            bankroll=1000.0,
+            position_size_usdc=10.0,
+            max_pool_pct=0.001,          # extremely tight if applied
+            pool_total_usdc=0.0,         # no pool data → cap skipped
+        )
+        assert size == pytest.approx(10.0)
+
+    def test_kelly_fraction_cap_ignored(self):
+        """kelly_fraction_cap kwarg is accepted but ignored (backward compat)."""
+        _, size = compute_position_size(
+            edge=0.40,
+            p_up=0.90,
+            side="YES",
+            yes_price=0.50,
+            bankroll=1000.0,
+            position_size_usdc=10.0,
+            kelly_fraction_cap=0.001,    # would have blocked in old code
+        )
+        assert size == pytest.approx(10.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -279,8 +326,10 @@ class TestStrategy:
         return {
             "strategy": {
                 "edge_threshold": edge_threshold,
-                "kelly_fraction": 0.25,
-                "max_position_usdc": 50.0,
+                "position_size_usdc": 10.0,
+                "min_position_usdc": 5.0,
+                "max_bankroll_pct": 0.10,
+                "max_pool_pct": 0.10,
                 "starting_bankroll_usdc": 1000.0,
                 "entry_window_seconds": 60,
                 "min_prob_diff": 0.03,
