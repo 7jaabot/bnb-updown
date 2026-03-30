@@ -55,6 +55,12 @@ async function main() {
     }
   }
 
+  // Also include all_rounds.csv if it exists
+  const allRoundsCsv = path.join(LOGS_DIR, 'rounds', 'all_rounds.csv');
+  if (fs.existsSync(allRoundsCsv)) {
+    csvFiles.push({ path: allRoundsCsv, tabName: 'all_rounds', strategy: 'all_rounds', mode: 'rounds' });
+  }
+
   if (csvFiles.length === 0) {
     console.log('No CSV files found to sync.');
     return;
@@ -124,6 +130,8 @@ async function main() {
   await refreshStrategyComparison(sheets, existingTabs);
   await sleep(2000);
   await refreshDeepEdge(sheets, existingTabs);
+  await sleep(2000);
+  await refreshCrowdAccuracy(sheets, existingTabs);
 
   console.log('Done.');
 }
@@ -135,8 +143,8 @@ async function main() {
 
 async function refreshStrategyComparison(sheets, existingTabs) {
   const SSID = SPREADSHEET_ID;
-  const analysisTabs = ['🏆 Strategy Comparison', '🔗 Cross-Strategy (Epoch)', '📊 Deep Edge Analysis', '🎯 Optimal Filters', '📈 PnL Curves', '🕐 Time Heatmap'];
-  const STRATS = existingTabs.filter(t => !analysisTabs.includes(t) && !t.startsWith('combined_'));
+  const analysisTabs = ['🏆 Strategy Comparison', '🔗 Cross-Strategy (Epoch)', '📊 Deep Edge Analysis', '🎯 Optimal Filters', '📈 PnL Curves', '🕐 Time Heatmap', '👥 Crowd Accuracy'];
+  const STRATS = existingTabs.filter(t => !analysisTabs.includes(t) && !t.startsWith('combined_') && t !== 'all_rounds');
   const tab = existingTabs.find(t => t.includes('Strategy Comparison'));
   if (!tab) { console.log('  ⏸ Strategy Comparison tab not found'); return; }
 
@@ -308,8 +316,8 @@ async function refreshStrategyComparison(sheets, existingTabs) {
 
 async function refreshDeepEdge(sheets, existingTabs) {
   const SSID = SPREADSHEET_ID;
-  const analysisTabs = ['🏆 Strategy Comparison', '🔗 Cross-Strategy (Epoch)', '📊 Deep Edge Analysis', '🎯 Optimal Filters', '📈 PnL Curves', '🕐 Time Heatmap'];
-  const STRATS = existingTabs.filter(t => !analysisTabs.includes(t) && !t.startsWith('combined_'));
+  const analysisTabs = ['🏆 Strategy Comparison', '🔗 Cross-Strategy (Epoch)', '📊 Deep Edge Analysis', '🎯 Optimal Filters', '📈 PnL Curves', '🕐 Time Heatmap', '👥 Crowd Accuracy'];
+  const STRATS = existingTabs.filter(t => !analysisTabs.includes(t) && !t.startsWith('combined_') && t !== 'all_rounds');
   const tab = existingTabs.find(t => t.includes('Deep Edge'));
   if (!tab) { console.log('  ⏸ Deep Edge tab not found'); return; }
 
@@ -378,6 +386,204 @@ async function refreshDeepEdge(sheets, existingTabs) {
 }
 
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 👥 Crowd Accuracy — analyze crowd vs actual direction for all rounds
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function refreshCrowdAccuracy(sheets, existingTabs) {
+  const SSID = SPREADSHEET_ID;
+  const tabName = '👥 Crowd Accuracy';
+
+  // Load all_rounds data from the sheet tab
+  const allRoundsTab = existingTabs.find(t => t.toLowerCase() === 'all_rounds');
+  if (!allRoundsTab) {
+    console.log('  ⏸ Crowd Accuracy: no all_rounds tab found — skipping');
+    return;
+  }
+
+  let rows;
+  try {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SSID,
+      range: `'${allRoundsTab}'!A1:N50000`,
+    });
+    rows = res.data.values || [];
+  } catch (e) {
+    console.log(`  ⚠️ Crowd Accuracy: could not load all_rounds: ${e.message}`);
+    return;
+  }
+
+  if (rows.length < 2) {
+    console.log('  ⏸ Crowd Accuracy: all_rounds has no data');
+    return;
+  }
+
+  const h = rows[0];
+  const iEpoch = h.indexOf('epoch');
+  const iLockTs = h.indexOf('lock_ts');
+  const iTotalBnb = h.indexOf('final_total_bnb');
+  const iBullPct = h.indexOf('final_bull_pct');
+  const iBearPct = h.indexOf('final_bear_pct');
+  const iConviction = h.indexOf('crowd_conviction_pct');
+  const iCrowdSide = h.indexOf('crowd_side');
+  const iActual = h.indexOf('actual_direction');
+  const iCorrect = h.indexOf('crowd_correct');
+
+  if (iEpoch < 0 || iCorrect < 0) {
+    console.log('  ⏸ Crowd Accuracy: missing expected columns in all_rounds');
+    return;
+  }
+
+  // Parse all rounds (skip FLAT outcomes)
+  const rounds = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const actual = r[iActual] || '';
+    if (actual === 'FLAT' || actual === '') continue;
+    const correct = (r[iCorrect] || '').toLowerCase();
+    rounds.push({
+      epoch: parseInt(r[iEpoch]) || 0,
+      lock_ts: parseFloat(r[iLockTs]) || 0,
+      total_bnb: parseFloat(r[iTotalBnb]) || 0,
+      bull_pct: parseFloat(r[iBullPct]) || 0,
+      bear_pct: parseFloat(r[iBearPct]) || 0,
+      conviction: parseFloat(r[iConviction]) || 0,
+      crowd_side: r[iCrowdSide] || '',
+      actual,
+      correct: correct === 'true',
+    });
+  }
+
+  if (rounds.length === 0) {
+    console.log('  ⏸ Crowd Accuracy: no valid rounds to analyze');
+    return;
+  }
+
+  const total = rounds.length;
+  const correctCount = rounds.filter(r => r.correct).length;
+  const wrongCount = total - correctCount;
+  const accuracy = total > 0 ? correctCount / total * 100 : 0;
+
+  // Section 2: Accuracy by conviction bucket
+  const convBuckets = [
+    { label: '50-55%', lo: 0.50, hi: 0.55 },
+    { label: '55-60%', lo: 0.55, hi: 0.60 },
+    { label: '60-70%', lo: 0.60, hi: 0.70 },
+    { label: '70-80%', lo: 0.70, hi: 0.80 },
+    { label: '80-90%', lo: 0.80, hi: 0.90 },
+    { label: '90%+',   lo: 0.90, hi: 1.01 },
+  ];
+
+  const convRows = [
+    ['Conviction Range', 'Rounds', 'Crowd Correct', 'Crowd Wrong', 'Accuracy %', 'Avg Pool Size (BNB)'],
+  ];
+  for (const b of convBuckets) {
+    const bucket = rounds.filter(r => r.conviction >= b.lo && r.conviction < b.hi);
+    const bCorrect = bucket.filter(r => r.correct).length;
+    const bWrong = bucket.length - bCorrect;
+    const bAcc = bucket.length > 0 ? r2(bCorrect / bucket.length * 100) : 0;
+    const avgPool = bucket.length > 0 ? r2(bucket.reduce((s, r) => s + r.total_bnb, 0) / bucket.length) : 0;
+    convRows.push([b.label, bucket.length, bCorrect, bWrong, bAcc, avgPool]);
+  }
+
+  // Section 3: Accuracy by pool size bucket
+  const poolBuckets = [
+    { label: '< 1 BNB',   lo: 0,   hi: 1   },
+    { label: '1-5 BNB',   lo: 1,   hi: 5   },
+    { label: '5-10 BNB',  lo: 5,   hi: 10  },
+    { label: '10-50 BNB', lo: 10,  hi: 50  },
+    { label: '50+ BNB',   lo: 50,  hi: 1e9 },
+  ];
+
+  const poolRows = [
+    ['Pool Size', 'Rounds', 'Accuracy %'],
+  ];
+  for (const b of poolBuckets) {
+    const bucket = rounds.filter(r => r.total_bnb >= b.lo && r.total_bnb < b.hi);
+    const bCorrect = bucket.filter(r => r.correct).length;
+    const bAcc = bucket.length > 0 ? r2(bCorrect / bucket.length * 100) : 0;
+    poolRows.push([b.label, bucket.length, bAcc]);
+  }
+
+  // Section 4: Hourly pattern (UTC)
+  const hourlyData = {};
+  for (let h = 0; h < 24; h++) hourlyData[h] = { rounds: [], convictionSum: 0 };
+  for (const r of rounds) {
+    if (r.lock_ts > 0) {
+      const d = new Date(r.lock_ts * 1000);
+      const hour = d.getUTCHours();
+      hourlyData[hour].rounds.push(r);
+      hourlyData[hour].convictionSum += r.conviction;
+    }
+  }
+
+  const hourlyRows = [
+    ['Hour (UTC)', 'Rounds', 'Accuracy %', 'Avg Conviction %'],
+  ];
+  for (let h = 0; h < 24; h++) {
+    const bucket = hourlyData[h].rounds;
+    const bCorrect = bucket.filter(r => r.correct).length;
+    const bAcc = bucket.length > 0 ? r2(bCorrect / bucket.length * 100) : 0;
+    const avgConv = bucket.length > 0 ? r2(hourlyData[h].convictionSum / bucket.length * 100) : 0;
+    hourlyRows.push([String(h).padStart(2, '0'), bucket.length, bAcc, avgConv]);
+  }
+
+  // Build output rows
+  const outputRows = [
+    ['👥 CROWD ACCURACY ANALYSIS'],
+    [`Total rounds analyzed: ${total}`],
+    [`Crowd correct: ${r2(accuracy)}%`],
+    [`Crowd wrong: ${r2(100 - accuracy)}%`],
+    [],
+    ['── By Conviction ──────────────────────────'],
+    ...convRows,
+    [],
+    ['── By Pool Size ────────────────────────────'],
+    ...poolRows,
+  ];
+
+  // Hourly goes to the right (column H)
+  const hourlyColRows = [['── Hourly Pattern (UTC) ────────────────────'], ...hourlyRows];
+
+  // Create tab if needed
+  const tabExists = existingTabs.some(t => t.toLowerCase() === tabName.toLowerCase());
+  if (!tabExists) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SSID,
+      requestBody: { requests: [{ addSheet: { properties: { title: tabName } } }] },
+    });
+    existingTabs.push(tabName);
+    console.log(`  📄 Created tab: ${tabName}`);
+  }
+
+  const actualTab = existingTabs.find(t => t.toLowerCase() === tabName.toLowerCase()) || tabName;
+
+  // Clear and write
+  await sheets.spreadsheets.values.clear({
+    spreadsheetId: SSID,
+    range: `'${actualTab}'!A1:M60`,
+  });
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SSID,
+    range: `'${actualTab}'!A1`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: outputRows },
+  });
+
+  await sleep(1000);
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SSID,
+    range: `'${actualTab}'!H1`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: hourlyColRows },
+  });
+
+  console.log(`  ✅ Crowd Accuracy refreshed: ${total} rounds, accuracy=${r2(accuracy)}%`);
+}
+
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 function r2(n) { return Math.round(n * 100) / 100; }
 function r4(n) { return Math.round(n * 10000) / 10000; }
@@ -386,8 +592,8 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 async function refreshEpochMap(sheets, existingTabs) {
   const SSID = SPREADSHEET_ID;
   // Dynamically detect strategy tabs (exclude analysis tabs)
-  const analysisTabs = ['🏆 Strategy Comparison', '🔗 Cross-Strategy (Epoch)', '📊 Deep Edge Analysis', '🎯 Optimal Filters', '📈 PnL Curves', '🕐 Time Heatmap'];
-  const STRATS = existingTabs.filter(t => !analysisTabs.includes(t) && !t.startsWith('combined_'));
+  const analysisTabs = ['🏆 Strategy Comparison', '🔗 Cross-Strategy (Epoch)', '📊 Deep Edge Analysis', '🎯 Optimal Filters', '📈 PnL Curves', '🕐 Time Heatmap', '👥 Crowd Accuracy'];
+  const STRATS = existingTabs.filter(t => !analysisTabs.includes(t) && !t.startsWith('combined_') && t !== 'all_rounds');
   const stratTab = existingTabs.find(t => t.toLowerCase() === '🔗 cross-strategy (epoch)'.toLowerCase())
     || '🔗 Cross-Strategy (Epoch)';
 
