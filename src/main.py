@@ -1362,17 +1362,26 @@ class ParallelBot:
             seconds_to_lock_fresh = round_data.lock_ts - time.time()
             window = window_from_round(round_data, entry_window_seconds=self._entry_window_seconds)
 
-            signals_fired = []
-            for runner in self._runners:
-                if runner["sniped_this_epoch"] or runner["traded_this_epoch"]:
-                    continue
-                runner["sniped_this_epoch"] = True
-                key = runner["key"]
-                strategy = runner["strategy"]
-                trader = runner["trader"]
+            # Evaluate ALL strategies in parallel (ThreadPoolExecutor)
+            # Time check done ONCE before evaluation — if we're in the window, we commit
+            if seconds_to_lock_fresh < self._min_seconds_before_lock:
+                self.logger.warning(
+                    f"ParallelBot sniper too late ({seconds_to_lock_fresh:.1f}s < "
+                    f"{self._min_seconds_before_lock}s min) — skipping all"
+                )
+                for r in self._runners:
+                    r["sniped_this_epoch"] = True
+                self._refresh_display()
+                return
 
+            eligible = [r for r in self._runners if not r["sniped_this_epoch"] and not r["traded_this_epoch"]]
+            for r in eligible:
+                r["sniped_this_epoch"] = True
+
+            def _evaluate_runner(runner):
+                """Evaluate a single strategy (runs in thread pool)."""
                 try:
-                    signal = strategy.evaluate(
+                    return runner["key"], runner["strategy"].evaluate(
                         prices=prices,
                         yes_price=round_data.yes_price_equiv,
                         window=window,
@@ -1382,22 +1391,25 @@ class ParallelBot:
                         pool_bear_bnb=round_data.bear_bnb,
                     )
                 except Exception as e:
-                    self.logger.error(f"Strategy {key} evaluate() error: {e}", exc_info=True)
-                    signal = None
+                    self.logger.error(f"Strategy {runner['key']} evaluate() error: {e}", exc_info=True)
+                    return runner["key"], None
 
-                if signal:
-                    if seconds_to_lock_fresh < self._min_seconds_before_lock:
-                        self.logger.warning(
-                            f"ParallelBot sniper too late for {key} "
-                            f"({seconds_to_lock_fresh:.1f}s < {self._min_seconds_before_lock}s min)"
-                        )
-                        continue
-                    try:
-                        trader.enter_trade(signal, window)
-                        runner["traded_this_epoch"] = True
-                        signals_fired.append(f"{key}:{signal.side}@{signal.edge:.2f}")
-                    except Exception as e:
-                        self.logger.error(f"Strategy {key} enter_trade() error: {e}", exc_info=True)
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(len(eligible), 8)) as executor:
+                results = list(executor.map(_evaluate_runner, eligible))
+
+            # Enter trades for strategies that signaled (sequential — fast, just bookkeeping)
+            signals_fired = []
+            for key, signal in results:
+                if signal is None:
+                    continue
+                runner = next(r for r in self._runners if r["key"] == key)
+                try:
+                    runner["trader"].enter_trade(signal, window)
+                    runner["traded_this_epoch"] = True
+                    signals_fired.append(f"{key}:{signal.side}@{signal.edge:.2f}")
+                except Exception as e:
+                    self.logger.error(f"Strategy {key} enter_trade() error: {e}", exc_info=True)
 
             # Update bankrolls for all strategies
             for runner in self._runners:
