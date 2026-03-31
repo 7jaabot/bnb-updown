@@ -187,73 +187,79 @@ def prompt_edge_filter(strategy_label: str = "") -> 'EdgeFilter':
 
 
 def select_strategy_interactive(config: dict):
-    """Display strategy selection menu and return a strategy instance."""
+    """
+    Display strategy selection menu and return either:
+      - None         → parallel mode (all 17 strategies, ParallelBot)
+      - CombinedStrategy → combined mode (comma-separated selection)
+      - BaseStrategy → single strategy mode
+
+    Returns (result, is_parallel) where is_parallel=True means ParallelBot should be used.
+    """
     from strategies.combined import CombinedStrategy, EdgeFilter
 
     strategy_list = list(STRATEGIES.items())
 
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 55)
     print("  Select Strategy")
-    print("=" * 50)
-    print("  [0] 🔗 Combined (multiple strategies consensus)")
+    print("=" * 55)
+    print("  [0] 🚀 ALL strategies (parallel paper trading)")
     for i, (key, cls) in enumerate(strategy_list, 1):
         try:
             name = cls(config).name
         except Exception:
             name = key
         print(f"  [{i}] {name}")
-    print("=" * 50)
+    print("=" * 55)
+    print("  Enter a number, or comma-separated for combined (e.g. 5,11,7)")
 
     while True:
         choice = input("Select strategy: ").strip()
+
+        # Check for comma-separated multi-select (combined strategy)
+        if "," in choice:
+            try:
+                indices = [int(x.strip()) - 1 for x in choice.split(",")]
+                if all(0 <= i < len(strategy_list) for i in indices) and len(indices) >= 2:
+                    # Combined strategy mode
+                    strategies = []
+                    edge_filters = {}
+                    print("\n  🔗 Combined Strategy — configuring edge filters")
+                    for idx in indices:
+                        key, cls = strategy_list[idx]
+                        strat = cls(config)
+                        strategies.append((key, strat))
+                        print(f"\n  ── {strat.name} ──")
+                        ef = prompt_edge_filter(strat.name)
+                        if ef.min_edge is not None or ef.max_edge is not None:
+                            edge_filters[key] = ef
+
+                    combined = CombinedStrategy(config, strategies, edge_filters)
+                    print(f"\n  → {combined.name}")
+                    if edge_filters:
+                        for name, ef in edge_filters.items():
+                            print(f"    Edge filter {name}: {ef}")
+                    print()
+                    return combined, False
+            except ValueError:
+                pass
+            print(f"  Invalid. Enter at least 2 numbers between 1-{len(strategy_list)}, separated by commas.")
+            continue
+
+        # Single number
         try:
             idx = int(choice)
             if 0 <= idx <= len(strategy_list):
                 break
         except ValueError:
             pass
-        print(f"Invalid choice. Please enter 0-{len(strategy_list)}.")
+        print(f"  Invalid choice. Enter 0-{len(strategy_list)}, or comma-separated numbers.")
 
     if idx == 0:
-        # Combined strategy mode
-        print("\n  🔗 Combined Strategy — select strategies to combine")
-        print("  Available strategies:")
-        for i, (key, cls) in enumerate(strategy_list, 1):
-            try:
-                name = cls(config).name
-            except Exception:
-                name = key
-            print(f"    [{i}] {name}")
-
-        while True:
-            combo_input = input("  Enter strategy numbers separated by commas (e.g. 1,4,11): ").strip()
-            try:
-                indices = [int(x.strip()) - 1 for x in combo_input.split(",")]
-                if all(0 <= i < len(strategy_list) for i in indices) and len(indices) >= 2:
-                    break
-            except ValueError:
-                pass
-            print(f"  Invalid. Enter at least 2 numbers between 1-{len(strategy_list)}, separated by commas.")
-
-        # Create sub-strategies and prompt edge filter for each
-        strategies = []
-        edge_filters = {}
-        for idx in indices:
-            key, cls = strategy_list[idx]
-            strat = cls(config)
-            strategies.append((key, strat))
-            print(f"\n  ── {strat.name} ──")
-            ef = prompt_edge_filter(strat.name)
-            if ef.min_edge is not None or ef.max_edge is not None:
-                edge_filters[key] = ef
-
-        combined = CombinedStrategy(config, strategies, edge_filters)
-        print(f"\n  → {combined.name}")
-        if edge_filters:
-            for name, ef in edge_filters.items():
-                print(f"    Edge filter {name}: {ef}")
+        # Parallel mode — all strategies
+        print("\n  🚀 ALL strategies — parallel paper trading mode")
+        print(f"  → {len(strategy_list)} strategies will run simultaneously")
         print()
-        return combined
+        return None, True  # signal ParallelBot
 
     else:
         # Single strategy mode
@@ -284,17 +290,22 @@ def select_strategy_interactive(config: dict):
             strategy.evaluate = filtered_evaluate
 
         print()
-        return strategy
+        return strategy, False
 
 
-def select_mode_interactive(config: dict) -> tuple[str, object, object]:
+def select_mode_interactive(config: dict):
     """
-    Display an interactive menu and return (mode, trader, strategy).
+    Display an interactive menu and return one of:
+      - (mode, trader, strategy)  for single/combined strategy
+      - ("parallel", None, None)  for parallel mode (caller will use ParallelBot)
 
-    Returns:
-        (mode, trader, strategy) where mode is "live" or "paper",
-        trader is a LiveTrader or PaperTrader instance,
-        and strategy is a BaseStrategy instance.
+    For single/combined:
+        mode: "live" or "paper"
+        trader: LiveTrader or PaperTrader instance
+        strategy: BaseStrategy instance
+
+    For parallel:
+        Returns ("parallel", None, None) — caller creates ParallelBot.
     """
     print("\n" + "=" * 40)
     print("  BNB Up/Down 5mn Trading Bot")
@@ -313,7 +324,14 @@ def select_mode_interactive(config: dict) -> tuple[str, object, object]:
     config["_is_paper"] = (choice == "2")
 
     # Select strategy FIRST so we can set paths before creating the trader
-    strategy = select_strategy_interactive(config)
+    strategy, is_parallel = select_strategy_interactive(config)
+
+    if is_parallel:
+        # Parallel mode: ParallelBot handles everything — only paper trading
+        if choice == "1":
+            print("  ⚠️  Parallel mode is paper trading only. Switching to paper.")
+            config["_is_paper"] = True
+        return "parallel", None, None
 
     # For CombinedStrategy, build a unique key with PID to allow parallel instances
     from strategies.combined import CombinedStrategy
@@ -1106,6 +1124,436 @@ class PolymarketBot:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Parallel Bot (all strategies simultaneously)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ParallelBot:
+    """
+    Runs ALL strategies simultaneously in a single process (paper trading only).
+
+    Architecture:
+    - ONE BinanceFeed (shared WebSocket)
+    - ONE PancakeClient (shared RPC)
+    - ONE RoundLogger (shared, logs each epoch once)
+    - 17 independent (strategy, paper_trader) pairs
+    - Each strategy has its own PaperTrader with independent bankroll
+    - On each tick: round data fetched ONCE, then all 17 strategies evaluated
+    - Error isolation: each strategy's evaluate() is wrapped in try/except
+    - Prefetch: all strategies prefetch in parallel (ThreadPoolExecutor)
+    - Dashboard: simplified — shows epoch info + signals from all strategies
+    """
+
+    def __init__(self, config: dict):
+        self.config = config
+        self.logger = logging.getLogger("ParallelBot")
+
+        # Shared components
+        self.binance = BinanceFeed(buffer_seconds=310)
+        self.pancake = PancakeClient(
+            rpc_url=config.get("pancake", {}).get("rpc_url", None),
+            contract_address=config.get("pancake", {}).get("contract_address", "0x18B2A687610328590Bc8F2e5fEdDe3b582A49cdA"),
+            use_mock_on_failure=config.get("pancake", {}).get("use_mock_on_failure", True),
+            timeout=config.get("pancake", {}).get("timeout_seconds", 8),
+        )
+        self.round_logger = RoundLogger()
+
+        # Create 17 (strategy, paper_trader) pairs with isolated configs and log files
+        self._runners: list[dict] = []
+        for key, cls in STRATEGIES.items():
+            runner_config = dict(config)  # shallow copy
+            runner_config["_is_paper"] = True
+            runner_config.setdefault("paper_trading", {})
+            runner_config["paper_trading"] = dict(runner_config.get("paper_trading", {}))
+            runner_config["paper_trading"]["log_file"] = f"logs/paper/{key}/{key}.json"
+
+            try:
+                strategy = cls(runner_config)
+            except Exception as e:
+                self.logger.warning(f"Could not init strategy {key}: {e}")
+                continue
+
+            trader = PaperTrader(runner_config)
+            # Wire feeds to each trader
+            if hasattr(trader, '_pancake_client'):
+                trader._pancake_client = self.pancake
+            if hasattr(trader, '_binance_feed'):
+                trader._binance_feed = self.binance
+            if hasattr(trader, 'resolve_pending_on_startup'):
+                trader.resolve_pending_on_startup()
+
+            self._runners.append({
+                "key": key,
+                "strategy": strategy,
+                "trader": trader,
+                "config": runner_config,
+                "traded_this_epoch": False,
+                "prefetch_done": False,
+                "sniped_this_epoch": False,
+            })
+
+        self.logger.info(f"ParallelBot: initialized {len(self._runners)} strategy runners")
+
+        # Dashboard — use first trader for now (simplified)
+        from dashboard import Dashboard
+        self._primary_trader = self._runners[0]["trader"] if self._runners else PaperTrader(config)
+        self.dashboard = Dashboard(trader=self._primary_trader, binance=self.binance, mode="paper")
+        self.dashboard._strategy_name = f"ALL ({len(self._runners)} strategies)"
+
+        # Bot state
+        self._running = False
+        self._last_epoch: int = -1
+        self._last_round_data: 'PancakeRound | None' = None
+        self._last_poll_ts: float = 0.0
+        self._in_entry_window: bool = False
+        self._live_ref = None
+
+        _scfg = config.get("strategy", {})
+        self._sniper_window_seconds: float = _scfg.get("sniper_window_seconds", 7)
+        self._min_seconds_before_lock = _scfg.get("min_seconds_before_lock", 4)
+        self._poll_interval = config.get("polymarket", {}).get("poll_interval_seconds", 5)
+        # entry_window_seconds: take from first runner's strategy
+        self._entry_window_seconds = (
+            self._runners[0]["strategy"].entry_window_seconds if self._runners else 60
+        )
+
+    def _refresh_display(self):
+        if self._live_ref is not None:
+            try:
+                self._live_ref.update(self.dashboard.render())
+            except Exception:
+                pass
+
+    def _on_price(self, pp: 'PricePoint'):
+        self.logger.debug(f"BNB price: {pp.price:.2f}")
+
+    async def _run_main_loop(self):
+        self.logger.info("ParallelBot: starting main loop...")
+        while self._running:
+            try:
+                await self._tick()
+            except Exception as e:
+                self.logger.error(f"ParallelBot tick error: {e}", exc_info=True)
+            await asyncio.sleep(self._poll_interval)
+
+    async def _update_chainlink_price(self):
+        while self._running:
+            try:
+                loop = asyncio.get_event_loop()
+                price = await loop.run_in_executor(None, self.pancake.get_chainlink_bnb_price)
+                if price is not None:
+                    self.dashboard._chainlink_bnb_price = price
+            except Exception as e:
+                self.logger.debug(f"Chainlink price refresh failed: {e}")
+            await asyncio.sleep(10)
+
+    async def _tick(self):
+        now = time.time()
+        loop = asyncio.get_event_loop()
+
+        poll_interval_outside = 30.0
+        should_poll = (
+            self._in_entry_window
+            or self._last_round_data is None
+            or (now - self._last_poll_ts) >= poll_interval_outside
+        )
+
+        round_data = self._last_round_data
+        if should_poll:
+            fetched = await loop.run_in_executor(None, self.pancake.get_current_round)
+            if fetched is not None:
+                round_data = fetched
+                self._last_round_data = round_data
+                self._last_poll_ts = now
+            elif round_data is None:
+                self.logger.warning("ParallelBot: no round data — skipping tick")
+                self.dashboard.update_status("⚠️ PancakeSwap unavailable")
+                self._refresh_display()
+                return
+
+        current_epoch = round_data.epoch
+        if current_epoch != self._last_epoch:
+            self._on_new_epoch(current_epoch, round_data)
+
+        seconds_to_lock = round_data.lock_ts - now
+        self._in_entry_window = 0 < seconds_to_lock <= self._entry_window_seconds
+
+        window = window_from_round(round_data, entry_window_seconds=self._entry_window_seconds)
+        self.dashboard.update_window(window)
+        self.dashboard.update_round_info(
+            epoch=current_epoch,
+            lock_price=getattr(round_data, 'lock_price', None),
+            pool_total_bnb=getattr(round_data, 'total_bnb', None),
+            p_up=None, edge=None, signal_side=None, bet_bnb=None, bet_usdc=None,
+        )
+
+        if not self._in_entry_window:
+            if seconds_to_lock <= 0:
+                self.dashboard.update_status("🔒 Round locked")
+            else:
+                self.dashboard.update_status("⏳ Waiting for entry window")
+            self._refresh_display()
+            return
+
+        window_prices_raw = self.binance.get_window_prices(round_data.start_ts)
+        prices = [pp.price for pp in window_prices_raw]
+
+        if not prices:
+            self._refresh_display()
+            return
+
+        # ── Phase 1: Prefetch all strategies in parallel ──
+        any_needs_prefetch = any(
+            not r["prefetch_done"] and not r["traded_this_epoch"]
+            for r in self._runners
+        )
+        if any_needs_prefetch and seconds_to_lock > self._sniper_window_seconds:
+            self.dashboard.update_status("📡 Pre-loading strategy data (all strategies)...")
+            self._refresh_display()
+
+            def _prefetch_runner(runner):
+                try:
+                    if not runner["prefetch_done"] and not runner["traded_this_epoch"]:
+                        runner["strategy"].prefetch(prices, epoch=current_epoch)
+                        runner["prefetch_done"] = True
+                except Exception as e:
+                    self.logger.warning(f"Prefetch failed for {runner['key']}: {e}")
+                    runner["prefetch_done"] = True  # mark done to avoid retrying
+
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(len(self._runners), 8)) as executor:
+                list(executor.map(_prefetch_runner, self._runners))
+
+            self.dashboard.update_status("📡 All strategies pre-loaded — awaiting sniper window")
+            self.dashboard.log(
+                f"Epoch #{current_epoch} | Lock in {seconds_to_lock:.0f}s | "
+                f"Phase 1: pre-loaded {len(self._runners)} strategies"
+            )
+            self._refresh_display()
+            return
+
+        # ── Phase 2: Sniper — evaluate ALL strategies once ──
+        any_can_snipe = any(
+            not r["sniped_this_epoch"] and not r["traded_this_epoch"]
+            for r in self._runners
+        )
+        if (
+            any_can_snipe
+            and seconds_to_lock <= self._sniper_window_seconds
+            and seconds_to_lock >= self._min_seconds_before_lock
+        ):
+            self.dashboard.update_status("🎯 SNIPER — evaluating all strategies...")
+            self._refresh_display()
+
+            # Fresh on-chain poll
+            fresh_round = await loop.run_in_executor(None, self.pancake.get_current_round)
+            if fresh_round is not None:
+                round_data = fresh_round
+                self._last_round_data = round_data
+                self._last_poll_ts = now
+
+            window_prices_raw = self.binance.get_window_prices(round_data.start_ts)
+            prices = [pp.price for pp in window_prices_raw]
+            if not prices:
+                self.logger.warning("ParallelBot sniper: no prices — aborting")
+                self.dashboard.update_status("⚠️ Sniper: no prices")
+                self._refresh_display()
+                return
+
+            seconds_to_lock_fresh = round_data.lock_ts - time.time()
+            window = window_from_round(round_data, entry_window_seconds=self._entry_window_seconds)
+
+            signals_fired = []
+            for runner in self._runners:
+                if runner["sniped_this_epoch"] or runner["traded_this_epoch"]:
+                    continue
+                runner["sniped_this_epoch"] = True
+                key = runner["key"]
+                strategy = runner["strategy"]
+                trader = runner["trader"]
+
+                try:
+                    signal = strategy.evaluate(
+                        prices=prices,
+                        yes_price=round_data.yes_price_equiv,
+                        window=window,
+                        is_mock_data=round_data.is_mock,
+                        pool_total_bnb=round_data.total_bnb,
+                        pool_bull_bnb=round_data.bull_bnb,
+                        pool_bear_bnb=round_data.bear_bnb,
+                    )
+                except Exception as e:
+                    self.logger.error(f"Strategy {key} evaluate() error: {e}", exc_info=True)
+                    signal = None
+
+                if signal:
+                    if seconds_to_lock_fresh < self._min_seconds_before_lock:
+                        self.logger.warning(
+                            f"ParallelBot sniper too late for {key} "
+                            f"({seconds_to_lock_fresh:.1f}s < {self._min_seconds_before_lock}s min)"
+                        )
+                        continue
+                    try:
+                        trader.enter_trade(signal, window)
+                        runner["traded_this_epoch"] = True
+                        signals_fired.append(f"{key}:{signal.side}@{signal.edge:.2f}")
+                    except Exception as e:
+                        self.logger.error(f"Strategy {key} enter_trade() error: {e}", exc_info=True)
+
+            # Update bankrolls for all strategies
+            for runner in self._runners:
+                if hasattr(runner["trader"].metrics, 'bankroll'):
+                    runner["strategy"].update_bankroll(runner["trader"].metrics.bankroll)
+
+            if signals_fired:
+                self.dashboard.log(
+                    f"🎯 Sniper epoch #{current_epoch} | {len(signals_fired)} signals: "
+                    + ", ".join(signals_fired)
+                )
+                self.dashboard.update_status(f"✅ {len(signals_fired)} trades entered")
+            else:
+                self.dashboard.log(f"Sniper epoch #{current_epoch} | No signals from {len(self._runners)} strategies")
+                self.dashboard.update_status("🔍 No signals")
+            self._refresh_display()
+            return
+
+        # Status between phases
+        if seconds_to_lock > self._sniper_window_seconds:
+            all_prefetched = all(r["prefetch_done"] for r in self._runners)
+            phase_str = "📡 Pre-loaded" if all_prefetched else "📡 Pre-loading"
+            self.dashboard.update_status(
+                f"{phase_str} | {len(self._runners)} strategies | "
+                f"Sniper in {seconds_to_lock - self._sniper_window_seconds:.0f}s"
+            )
+        else:
+            already_traded = sum(1 for r in self._runners if r["traded_this_epoch"])
+            self.dashboard.update_status(
+                f"⏸ Sniper fired | {already_traded}/{len(self._runners)} traded"
+            )
+        self._refresh_display()
+
+    def _on_new_epoch(self, new_epoch: int, round_data: 'PancakeRound'):
+        """Handle epoch change: resolve trades for all traders, reset state."""
+        if self._last_epoch > 0:
+            resolve_epoch = self._last_epoch - 1
+            try:
+                closed_round = self.pancake.get_round_by_epoch(resolve_epoch)
+            except Exception as e:
+                self.logger.warning(f"ParallelBot: could not fetch epoch {resolve_epoch}: {e}")
+                closed_round = None
+
+            if closed_round is not None:
+                bnb_open = closed_round.lock_price
+                bnb_close = closed_round.close_price
+
+                if bnb_open is not None and bnb_close is not None and closed_round.oracle_called:
+                    direction = "UP" if bnb_close > bnb_open else "DOWN"
+                    pct_change = abs(bnb_close / bnb_open - 1)
+                    self.logger.info(
+                        f"🔚 Epoch #{resolve_epoch} closed: BNB {bnb_open:.4f} → {bnb_close:.4f} "
+                        f"({direction} {pct_change:.3%})"
+                    )
+                    self.dashboard.log(
+                        f"🔚 Round #{resolve_epoch}: BNB {direction} {pct_change:.2%}"
+                    )
+
+                    # Resolve trades for ALL traders (error-isolated)
+                    for runner in self._runners:
+                        try:
+                            runner["trader"].resolve_trades(resolve_epoch, bnb_open, bnb_close)
+                        except Exception as e:
+                            self.logger.error(
+                                f"ParallelBot: resolve_trades failed for {runner['key']}: {e}",
+                                exc_info=True,
+                            )
+
+                    # Log round ONCE
+                    try:
+                        self.round_logger.log_round(
+                            epoch=resolve_epoch,
+                            lock_ts=float(closed_round.lock_ts),
+                            final_bull_bnb=closed_round.bull_bnb,
+                            final_bear_bnb=closed_round.bear_bnb,
+                            bnb_open=bnb_open,
+                            bnb_close=bnb_close,
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"ParallelBot: RoundLogger failed: {e}")
+                else:
+                    self.logger.warning(
+                        f"Epoch #{resolve_epoch}: oracle not settled — skipping resolution"
+                    )
+
+        # Reset per-epoch state for all runners
+        for runner in self._runners:
+            runner["traded_this_epoch"] = False
+            runner["prefetch_done"] = False
+            runner["sniped_this_epoch"] = False
+
+        self._last_epoch = new_epoch
+        self._in_entry_window = False
+
+        bnb = self.binance.last_price
+        bnb_str = f"${bnb:.2f}" if bnb is not None else "N/A"
+        self.logger.info(
+            f"🆕 Epoch #{new_epoch} started | BNB: {bnb_str} | "
+            f"Lock at {round_data.lock_ts:.0f} (in {round_data.lock_ts - time.time():.0f}s)"
+        )
+        self.dashboard.log(
+            f"🎲 Betting open: round #{new_epoch} | BNB: {bnb_str} | "
+            f"Lock in {round_data.lock_ts - time.time():.0f}s"
+        )
+        self.dashboard.update_status("⏳ Waiting for entry window")
+        self._refresh_display()
+
+    def stop(self):
+        self.logger.info("ParallelBot: shutting down...")
+        self._running = False
+        self.binance.stop()
+        for runner in self._runners:
+            try:
+                runner["trader"].print_summary()
+            except Exception:
+                pass
+
+    async def run(self):
+        self._running = True
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, self.stop)
+
+        setup_logging(self.config, dashboard_mode=True, strategy_key="parallel", trading_mode="paper")
+
+        live = self.dashboard.start()
+        live.start()
+        self._live_ref = live
+
+        try:
+            self.logger.info("=" * 60)
+            self.logger.info(f"  ParallelBot — {len(self._runners)} strategies — PAPER")
+            self.logger.info("=" * 60)
+
+            self.dashboard.log("Testing PancakeSwap/BSC connectivity...")
+            self._refresh_display()
+
+            api_ok = await loop.run_in_executor(None, self.pancake.check_connectivity)
+            if api_ok:
+                self.dashboard.log("✅ PancakeSwap connected — live on-chain data")
+            else:
+                self.dashboard.log("⚠️  PancakeSwap unreachable — MOCK DATA mode")
+            self._refresh_display()
+
+            self.binance.on_price = self._on_price
+            await asyncio.gather(
+                self.binance.run(),
+                self._run_main_loop(),
+                self._update_chainlink_price(),
+            )
+        finally:
+            live.stop()
+            self._live_ref = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1197,6 +1645,17 @@ def main():
     else:
         # Interactive menu — strategy paths are set inside before trader creation
         mode, trader, strategy = select_mode_interactive(config)
+
+        if mode == "parallel":
+            # Parallel mode: launch ParallelBot (paper trading, all strategies)
+            setup_logging(config, strategy_key="parallel", trading_mode="paper")
+            parallel_bot = ParallelBot(config)
+            try:
+                asyncio.run(parallel_bot.run())
+            except KeyboardInterrupt:
+                pass
+            return
+
         from strategies.combined import CombinedStrategy
         if isinstance(strategy, CombinedStrategy):
             sub_names = [s[0] for s in strategy.strategies]
