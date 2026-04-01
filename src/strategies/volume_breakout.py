@@ -284,18 +284,10 @@ class VolumeBreakoutStrategy(BaseStrategy):
         last_volume = all_volumes[-1]
         required_volume = prior_avg * self.confirm_multiplier
 
-        if last_volume < required_volume:
-            self.last_skip_reason = (
-                f"⏸ Volume not confirmed "
-                f"(last={last_volume:.2f} < {required_volume:.2f} = "
-                f"{self.confirm_multiplier}× avg {prior_avg:.2f})"
-            )
-            logger.debug(
-                f"[VolumeBreakout] Volume spike absent: "
-                f"last={last_volume:.2f} avg={prior_avg:.2f} "
-                f"threshold={required_volume:.2f}"
-            )
-            return None
+        # NOTE: volume confirmation pre-filter removed — volume ratio is not in the edge
+        # formula, so it was blocking trades that might have been profitable.
+        # Low-volume breakouts will produce low edge → filtered by edge_threshold.
+        vol_ratio = last_volume / prior_avg if prior_avg > 0 else 1.0
 
         # ── Breakout detection ────────────────────────────────────────────────
         buffer = poc * self.buffer_pct

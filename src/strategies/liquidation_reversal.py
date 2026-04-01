@@ -385,16 +385,11 @@ class LiquidationReversalStrategy(BaseStrategy):
             f"(ws_events={self._listener.total_received})"
         )
 
-        # ── 2. Minimum volume threshold ───────────────────────────────────────
-        if total_vol < self.min_volume_usdt:
-            self.last_skip_reason = (
-                f"⏸ Total liq volume too low "
-                f"({total_vol/1000:.1f}k < {self.min_volume_usdt/1000:.0f}k USDT)"
-            )
-            self._update_history(long_vol, short_vol)
-            return None
+        # NOTE: min_volume_usdt pre-filter removed — low volume produces weak z-score
+        # → low edge → naturally filtered by edge_threshold.
+        # Safety: if total_vol == 0, z-score is 0 → edge 0 → skip.
 
-        # ── 3. Z-score computation ────────────────────────────────────────────
+        # ── 2. Z-score computation ────────────────────────────────────────────
         zscore = self._compute_zscore(net_imbalance)
         self._update_history(long_vol, short_vol)
 
