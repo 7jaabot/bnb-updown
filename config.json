@@ -23,7 +23,7 @@
     "follow_min_majority_pct": 0.55,
     "funding_rate_positive_threshold": 0.0001,
     "funding_rate_negative_threshold": -0.0001,
-    "funding_rate_url": "https://fapi.binance.com/fapi/v1/fundingRate?symbol=BNBUSDT&limit=1",
+    "funding_rate_url": "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BNBUSDT",
     "oi_delta_threshold": 0.005,
     "oi_period": "5m",
     "liquidation_min_volume_usdt": 100000,
