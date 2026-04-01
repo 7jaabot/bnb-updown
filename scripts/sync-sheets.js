@@ -271,7 +271,7 @@ async function refreshStrategyComparison(sheets, existingTabs) {
      'Avg PnL/Trade ($)', 'Avg Edge', 'UP Trades', 'DOWN Trades', 'UP WR %', 'DOWN WR %',
      'Avg WIN PnL ($)', 'Avg LOSS PnL ($)', 'R/R Ratio', 'ROI %',
      'Avg Drift %', 'Drift >5%', 'Drift >10%'],
-    ...results,
+    ...results.sort((a, b) => b[4] - a[4]),  // Sort by Win Rate % descending
     [],
     ['📊 COMBINED'],
   ];
@@ -851,7 +851,7 @@ async function refreshEpochMap(sheets, existingTabs) {
   }
 
   // Pad midRows to exactly 17 rows so 🎯 starts at row 18 (I18)
-  while (midRows.length < 17) {
+  while (midRows.length < 19) {
     midRows.push([]);
   }
 
