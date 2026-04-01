@@ -151,7 +151,9 @@ class OrderBookStrategy(BaseStrategy):
         # Map imbalance ∈ [-1, 1] to p_up ∈ [0.01, 0.99]
         # imbalance=+1 → p_up=0.99 (pure bid pressure → UP)
         # imbalance=-1 → p_up=0.01 (pure ask pressure → DOWN)
-        p_up_raw = 0.5 + imbalance * 0.49
+        # Factor 0.98: imbalance maps nearly 1:1 to p_up displacement
+        # imbalance=0.11 → edge 0.108 (passes threshold), imbalance=0.30 → edge 0.294
+        p_up_raw = 0.5 + imbalance * 0.98
         p_win = max(0.01, min(0.99, p_up_raw))
 
         # Edge = abs(p_up - 0.50) — always positive, range [0, 0.49]
