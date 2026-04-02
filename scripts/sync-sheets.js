@@ -489,13 +489,13 @@ async function refreshCrowdAccuracy(sheets, existingTabs) {
   }
 
   // Section 3: Accuracy by pool size bucket
-  const poolBuckets = [
-    { label: '< 1 BNB',   lo: 0,   hi: 1   },
-    { label: '1-5 BNB',   lo: 1,   hi: 5   },
-    { label: '5-10 BNB',  lo: 5,   hi: 10  },
-    { label: '10-50 BNB', lo: 10,  hi: 50  },
-    { label: '50+ BNB',   lo: 50,  hi: 1e9 },
-  ];
+  const poolBuckets = [];
+  poolBuckets.push({ label: '< 0.5 BNB', lo: 0, hi: 0.5 });
+  for (let lo = 0.5; lo < 10; lo += 0.5) {
+    const hi = lo + 0.5;
+    poolBuckets.push({ label: `${lo}-${hi} BNB`, lo, hi });
+  }
+  poolBuckets.push({ label: '10+ BNB', lo: 10, hi: 1e9 });
 
   const poolRows = [
     ['Pool Size', 'Rounds', 'Accuracy %'],
