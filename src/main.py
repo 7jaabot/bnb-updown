@@ -695,11 +695,23 @@ class PolymarketBot:
             except Exception as e:
                 self.logger.warning(f"Prefetch failed (non-fatal): {e}")
 
-            # For live mode: pre-build and pre-sign both transactions
+            # For live mode: compute dynamic position size + pre-build and pre-sign both TXs
             if self.mode == "live" and hasattr(self.trader, 'prepare_transactions'):
                 bnb_price = self.binance.last_price or 600.0
-                bet_usdc = self.config.get("strategy", {}).get("position_size_usdc", 10.0)
+                # Dynamic sizing: 5% of wallet, min $10, capped by pool later
+                wallet_bnb = self.trader.get_bnb_balance()
+                wallet_usdc = wallet_bnb * bnb_price
+                bet_usdc = max(
+                    self.config.get("strategy", {}).get("min_position_usdc", 10.0),
+                    wallet_usdc * 0.05,
+                )
+                # Update strategy position_size_usdc so evaluate() uses it
+                self.strategy.position_size_usdc = bet_usdc
                 bet_bnb = bet_usdc / bnb_price
+                self.logger.info(
+                    f"💰 Live sizing: wallet={wallet_usdc:.2f} USDC | "
+                    f"5%={wallet_usdc*0.05:.2f} | bet={bet_usdc:.2f} USDC ({bet_bnb:.6f} BNB)"
+                )
                 try:
                     ok = await loop.run_in_executor(
                         None,
