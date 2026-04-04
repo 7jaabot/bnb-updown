@@ -927,7 +927,7 @@ async function refreshEpochMap(sheets, existingTabs) {
     for (const [lo, hi] of edgeBuckets) {
       const bucket = trades.filter(t => t.edge >= lo && t.edge < hi);
       const bWins = bucket.filter(t => t.outcome === 'WIN').length;
-      if (bucket.length >= 5 && bWins / bucket.length > 0.5) {
+      if (bucket.length >= 5 && bWins / bucket.length >= 0.48) {
         profitableBuckets[s].push([lo, hi]);
       }
     }
