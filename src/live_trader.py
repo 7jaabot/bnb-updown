@@ -24,6 +24,10 @@ import json
 import logging
 import os
 import time
+import hashlib
+import fcntl
+from pathlib import Path
+from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from typing import Optional
 
@@ -38,6 +42,18 @@ BSC_RPC_URLS = [
     "https://bsc-dataseed2.defibit.io/",
     "https://1rpc.io/bnb",
 ]
+
+
+@contextmanager
+
+def _file_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield fh
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 # Minimal ABI — only the functions we call
 PANCAKE_ABI = [
@@ -218,6 +234,9 @@ class LiveTrader:
         self._last_fired_side: Optional[str] = None
         self._last_fired_epoch: Optional[int] = None
         self._last_fired_bet_bnb: Optional[float] = None
+        self._instance_id = f"pid-{os.getpid()}"
+        self._coordination_dir = Path(__file__).parent.parent / "logs" / "live" / ".coordination"
+        self._wallet_key: Optional[str] = None
 
         # Load .env and init
         self._load_env()
@@ -281,6 +300,7 @@ class LiveTrader:
 
         self._w3 = w3
         self._wallet_address = w3.to_checksum_address(wallet_addr)
+        self._wallet_key = hashlib.sha1(self._wallet_address.lower().encode()).hexdigest()[:12]
 
         # Load account from private key (NEVER log the key)
         self._account = w3.eth.account.from_key(private_key)
@@ -325,6 +345,103 @@ class LiveTrader:
         """Return current wallet BNB balance."""
         balance_wei = self._w3.eth.get_balance(self._wallet_address)
         return balance_wei / 1e18
+
+    def _coordination_state_path(self) -> Path:
+        if not self._wallet_key:
+            raise RuntimeError("Wallet coordination key not initialized")
+        return self._coordination_dir / f"wallet-{self._wallet_key}.json"
+
+    def _load_coordination_state(self) -> dict:
+        path = self._coordination_state_path()
+        if not path.exists():
+            return {"epochs": {}}
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            logger.warning("Coordination state unreadable — resetting")
+            return {"epochs": {}}
+
+    def _save_coordination_state(self, state: dict) -> None:
+        path = self._coordination_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, indent=2, sort_keys=True))
+
+    def _epoch_already_claimed(self, epoch: int) -> bool:
+        with _file_lock(self._coordination_dir / f"wallet-{self._wallet_key}.lock"):
+            state = self._load_coordination_state()
+            rec = state.get("epochs", {}).get(str(epoch))
+            return bool(rec and rec.get("status") in {"prepared", "sent", "confirmed", "pending"})
+
+    def _claim_epoch(self, epoch: int, side: str, bet_bnb: float, stage: str) -> bool:
+        with _file_lock(self._coordination_dir / f"wallet-{self._wallet_key}.lock"):
+            state = self._load_coordination_state()
+            epochs = state.setdefault("epochs", {})
+            rec = epochs.get(str(epoch))
+            if rec and rec.get("status") in {"prepared", "sent", "confirmed", "pending"}:
+                logger.warning(
+                    f"Epoch {epoch} already claimed by {rec.get('instance_id')} "
+                    f"({rec.get('side')} | {rec.get('status')}) — skipping"
+                )
+                return False
+            epochs[str(epoch)] = {
+                "instance_id": self._instance_id,
+                "side": side,
+                "bet_bnb": bet_bnb,
+                "status": stage,
+                "updated_at": time.time(),
+            }
+            self._save_coordination_state(state)
+            return True
+
+    def _mark_epoch_sent(self, epoch: int, tx_hash: str) -> None:
+        with _file_lock(self._coordination_dir / f"wallet-{self._wallet_key}.lock"):
+            state = self._load_coordination_state()
+            rec = state.setdefault("epochs", {}).setdefault(str(epoch), {})
+            rec.update({
+                "instance_id": self._instance_id,
+                "tx_hash": tx_hash,
+                "status": "sent",
+                "updated_at": time.time(),
+            })
+            self._save_coordination_state(state)
+
+    def _release_epoch_claim(self, epoch: int, failed_status: str = "failed") -> None:
+        with _file_lock(self._coordination_dir / f"wallet-{self._wallet_key}.lock"):
+            state = self._load_coordination_state()
+            rec = state.setdefault("epochs", {}).get(str(epoch))
+            if rec:
+                rec["status"] = failed_status
+                rec["updated_at"] = time.time()
+                self._save_coordination_state(state)
+
+    def _build_signed_transaction(self, side: str, epoch: int, bet_bnb: float, gas_price: Optional[int] = None, nonce: Optional[int] = None):
+        bet_wei = int(bet_bnb * 1e18)
+        if side == "YES":
+            fn = self._contract.functions.betBull(epoch)
+            fn_name = "betBull"
+        else:
+            fn = self._contract.functions.betBear(epoch)
+            fn_name = "betBear"
+        if gas_price is None:
+            gas_price = self._estimate_gas_price()
+        if nonce is None:
+            nonce = self._w3.eth.get_transaction_count(self._wallet_address, "pending")
+        try:
+            gas_estimate = fn.estimate_gas({"from": self._wallet_address, "value": bet_wei})
+            gas_limit = int(gas_estimate * 1.2)
+        except Exception as e:
+            logger.warning(f"Gas estimation failed for {fn_name}: {e} — using 200000")
+            gas_limit = 200_000
+        tx = fn.build_transaction({
+            "from": self._wallet_address,
+            "value": bet_wei,
+            "gas": gas_limit,
+            "gasPrice": gas_price,
+            "nonce": nonce,
+            "chainId": 56,
+        })
+        signed = self._account.sign_transaction(tx)
+        return tx, signed, fn_name, gas_limit, gas_price, nonce
 
     def _check_safeguards(self, position_size_usdc: float, bnb_price: float) -> bool:
         """
@@ -399,17 +516,10 @@ class LiveTrader:
 
     def prepare_transactions(self, epoch: int, bet_bnb: float) -> bool:
         """
-        Phase 1 (pre-load): Pre-build and pre-sign BOTH bull and bear transactions.
+        Phase 1 (pre-load): pre-build BOTH bull and bear tx templates without reserving a nonce.
 
-        Stores them in self._prepared_txs dict keyed by "YES" and "NO".
-        Call fire_transaction(side) to broadcast the chosen one.
-
-        Args:
-            epoch: Current PancakeSwap epoch.
-            bet_bnb: Amount of BNB to wager.
-
-        Returns:
-            True if both transactions were successfully prepared, False otherwise.
+        Nonce is assigned only at fire time under a wallet-level inter-process lock.
+        This avoids nonce collisions when multiple live CLIs share one wallet.
         """
         if not self._w3 or not self._account or not self._contract:
             logger.error("prepare_transactions: Web3 not initialized")
@@ -421,8 +531,6 @@ class LiveTrader:
             return False
 
         gas_price = self._estimate_gas_price()
-        nonce = self._w3.eth.get_transaction_count(self._wallet_address)
-
         prepared = {}
         for side, fn_name in [("YES", "betBull"), ("NO", "betBear")]:
             fn = getattr(self._contract.functions, fn_name)(epoch)
@@ -436,75 +544,88 @@ class LiveTrader:
                 logger.warning(f"prepare_transactions: gas estimate failed for {fn_name}: {e} — using 200000")
                 gas_limit = 200_000
 
-            tx = fn.build_transaction({
-                "from": self._wallet_address,
-                "value": bet_wei,
-                "gas": gas_limit,
-                "gasPrice": gas_price,
-                "nonce": nonce,
-                "chainId": 56,
-            })
-
-            try:
-                signed = self._account.sign_transaction(tx)
-                prepared[side] = {
-                    "tx": tx,
-                    "signed": signed,
-                    "epoch": epoch,
-                    "bet_bnb": bet_bnb,
-                    "nonce": nonce,
-                }
-                logger.debug(f"prepare_transactions: {fn_name}(epoch={epoch}) pre-signed | bet={bet_bnb:.6f} BNB")
-            except Exception as e:
-                logger.error(f"prepare_transactions: signing failed for {fn_name}: {e}")
-                return False
+            prepared[side] = {
+                "epoch": epoch,
+                "bet_bnb": bet_bnb,
+                "gas_limit": gas_limit,
+                "gas_price": gas_price,
+                "fn_name": fn_name,
+            }
+            logger.debug(f"prepare_transactions: {fn_name}(epoch={epoch}) prepared without nonce | bet={bet_bnb:.6f} BNB")
 
         self._prepared_txs = prepared
         self._prepared_epoch = epoch
         logger.info(
-            f"💡 Both transactions pre-signed for epoch {epoch} | "
-            f"bet={bet_bnb:.6f} BNB | gas_price={gas_price / 1e9:.1f} Gwei"
+            f"💡 Both transactions prepared for epoch {epoch} | "
+            f"bet={bet_bnb:.6f} BNB | gas_price={gas_price / 1e9:.1f} Gwei | nonce assigned at fire"
         )
         return True
 
     def fire_transaction(self, side: str) -> Optional[str]:
         """
-        Phase 2 (sniper): Fire the pre-signed transaction immediately (fire-and-forget).
+        Phase 2 (sniper): sign + send the chosen transaction under a wallet-level lock.
 
-        Does NOT wait for receipt — returns the tx hash immediately.
-        Call verify_transaction() after lock to check confirmation.
-
-        Args:
-            side: "YES" (bull) or "NO" (bear).
-
-        Returns:
-            Transaction hash hex string, or None on failure.
+        This guarantees one nonce assignment at a time and prevents two live CLIs
+        from betting the same epoch on the same wallet concurrently.
         """
         if not hasattr(self, '_prepared_txs') or side not in self._prepared_txs:
-            logger.error(f"fire_transaction: no pre-signed TX for side={side} — falling back to fresh TX")
+            logger.error(f"fire_transaction: no prepared TX template for side={side} — falling back to fresh TX")
             return None
 
         prepared = self._prepared_txs[side]
-        signed = prepared["signed"]
+        epoch = prepared["epoch"]
+        bet_bnb = prepared["bet_bnb"]
+        lock_path = self._coordination_dir / f"wallet-{self._wallet_key}.lock"
 
-        try:
-            tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
-            tx_hash_hex = tx_hash.hex()
-            self._last_fired_tx_hash = tx_hash_hex
-            self._last_fired_side = side
-            self._last_fired_epoch = prepared["epoch"]
-            self._last_fired_bet_bnb = prepared["bet_bnb"]
+        with _file_lock(lock_path):
+            state = self._load_coordination_state()
+            rec = state.setdefault("epochs", {}).get(str(epoch))
+            if rec and rec.get("status") in {"prepared", "sent", "confirmed", "pending"}:
+                logger.warning(
+                    f"fire_transaction: epoch {epoch} already claimed by {rec.get('instance_id')} "
+                    f"({rec.get('side')} | {rec.get('status')}) — aborting"
+                )
+                return None
 
-            fn_name = "betBull" if side == "YES" else "betBear"
-            logger.info(
-                f"🚀 FIRED {fn_name}(epoch={prepared['epoch']}) — "
-                f"tx={tx_hash_hex} | bet={prepared['bet_bnb']:.6f} BNB"
-            )
-            return tx_hash_hex
+            nonce = self._w3.eth.get_transaction_count(self._wallet_address, "pending")
+            try:
+                tx, signed, fn_name, _, _, nonce = self._build_signed_transaction(
+                    side=side,
+                    epoch=epoch,
+                    bet_bnb=bet_bnb,
+                    gas_price=prepared.get("gas_price"),
+                    nonce=nonce,
+                )
+            except Exception as e:
+                logger.error(f"fire_transaction: signing failed for side={side}: {e}")
+                return None
 
-        except Exception as e:
-            logger.error(f"fire_transaction: send failed for side={side}: {e}")
-            return None
+            try:
+                tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
+                tx_hash_hex = tx_hash.hex()
+                state.setdefault("epochs", {})[str(epoch)] = {
+                    "instance_id": self._instance_id,
+                    "side": side,
+                    "bet_bnb": bet_bnb,
+                    "status": "sent",
+                    "tx_hash": tx_hash_hex,
+                    "nonce": nonce,
+                    "updated_at": time.time(),
+                }
+                self._save_coordination_state(state)
+            except Exception as e:
+                logger.error(f"fire_transaction: send failed for side={side}: {e}")
+                return None
+
+        self._last_fired_tx_hash = tx_hash_hex
+        self._last_fired_side = side
+        self._last_fired_epoch = epoch
+        self._last_fired_bet_bnb = bet_bnb
+
+        logger.info(
+            f"🚀 FIRED {fn_name}(epoch={epoch}) — tx={tx_hash_hex} | bet={bet_bnb:.6f} BNB | nonce={nonce}"
+        )
+        return tx_hash_hex
 
     def verify_transaction(self, timeout: int = 30) -> Optional[bool]:
         """
@@ -576,43 +697,46 @@ class LiveTrader:
         self._trade_counter += 1
         trade_id = f"LT-{int(time.time())}-{self._trade_counter:04d}"
 
-        # Build transaction
-        gas_price = self._estimate_gas_price()
-        nonce = self._w3.eth.get_transaction_count(self._wallet_address)
+        lock_path = self._coordination_dir / f"wallet-{self._wallet_key}.lock"
+        with _file_lock(lock_path):
+            state = self._load_coordination_state()
+            rec = state.setdefault("epochs", {}).get(str(epoch))
+            if rec and rec.get("status") in {"prepared", "sent", "confirmed", "pending"}:
+                logger.warning(
+                    f"enter_trade: epoch {epoch} already claimed by {rec.get('instance_id')} "
+                    f"({rec.get('side')} | {rec.get('status')}) — aborting duplicate live trade"
+                )
+                return None
 
-        if signal.side == "YES":
-            fn = self._contract.functions.betBull(epoch)
-            description = f"betBull(epoch={epoch})"
-        else:
-            fn = self._contract.functions.betBear(epoch)
-            description = f"betBear(epoch={epoch})"
+            try:
+                tx, signed, fn_name, gas_limit, gas_price, nonce = self._build_signed_transaction(
+                    side=signal.side,
+                    epoch=epoch,
+                    bet_bnb=bet_bnb,
+                )
+            except Exception as e:
+                logger.error(f"Cannot build live transaction: {e}")
+                return None
 
-        try:
-            gas_estimate = fn.estimate_gas({
-                "from": self._wallet_address,
-                "value": bet_wei,
-            })
-            gas_limit = int(gas_estimate * 1.2)  # +20% buffer
-        except Exception as e:
-            logger.warning(f"Gas estimation failed: {e} — using default 200000")
-            gas_limit = 200_000
-
-        tx = fn.build_transaction({
-            "from": self._wallet_address,
-            "value": bet_wei,
-            "gas": gas_limit,
-            "gasPrice": gas_price,
-            "nonce": nonce,
-            "chainId": 56,  # BSC mainnet
-        })
-
-        # Execute
-        tx_hash = self._send_transaction(tx, description)
-        tx_status = "success" if tx_hash else "failed"
-
-        if tx_hash is None:
-            logger.error(f"Trade {trade_id} failed — transaction not confirmed.")
-            return None
+            try:
+                tx_hash_raw = self._w3.eth.send_raw_transaction(signed.raw_transaction)
+                tx_hash = tx_hash_raw.hex()
+                state.setdefault("epochs", {})[str(epoch)] = {
+                    "instance_id": self._instance_id,
+                    "side": signal.side,
+                    "bet_bnb": bet_bnb,
+                    "status": "sent",
+                    "tx_hash": tx_hash,
+                    "nonce": nonce,
+                    "updated_at": time.time(),
+                }
+                self._save_coordination_state(state)
+                tx_status = "success"
+                description = f"{fn_name}(epoch={epoch})"
+                logger.info(f"{description} sent under wallet lock | tx={tx_hash} | nonce={nonce} | gas={gas_limit}")
+            except Exception as e:
+                logger.error(f"Trade {trade_id} failed during send_raw_transaction: {e}")
+                return None
 
         # Build trade record
         entry_price = signal.yes_price if signal.side == "YES" else (1.0 - signal.yes_price)
