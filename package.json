@@ -1,0 +1,22 @@
+{
+  "name": "bnb-updown",
+  "version": "1.0.0",
+  "description": "BTC UP/DOWN 5-minute prediction bot for **PRDT Finance** (fork of polymarket-btc).",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@github-7jaabot:7jaabot/bnb-updown.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "googleapis": "^171.4.0"
+  }
+}

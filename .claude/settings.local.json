@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls /home/joris/projects/bnb-updown/_start_wsl*)",
+      "mcp__scheduled-tasks__list_scheduled_tasks",
+      "Bash(git config:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m ':*)"
+    ]
+  }
+}

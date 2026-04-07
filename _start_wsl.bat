@@ -7,6 +7,6 @@ echo   (BSC live data)
 echo ========================================
 echo.
 
-wsl bash /home/joris/.openclaw/workspace/repos/bnb-updown/_start_wsl.sh %*
+wsl bash /home/joris/projects/bnb-updown/_start_wsl.sh %*
 
 pause

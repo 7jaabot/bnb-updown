@@ -1,7 +1,7 @@
 #!/bin/bash
 # PancakeSwap BNB/USD 5mn Trading Bot — WSL2 Launcher
 
-REPO="/home/joris/.openclaw/workspace/repos/bnb-updown"
+REPO="/home/joris/projects/bnb-updown"
 
 echo "========================================"
 echo "  PancakeSwap BNB/USD 5mn Trading Bot"
