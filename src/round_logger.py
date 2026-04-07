@@ -11,13 +11,37 @@ Deduplicates by epoch.
 from __future__ import annotations
 
 import csv
-import fcntl
 import json
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Optional
+
+if sys.platform == "win32":
+    import msvcrt as _msvcrt
+
+    def _flock(fd, exclusive: bool) -> None:
+        fd.seek(0)
+        if exclusive:
+            while True:
+                try:
+                    _msvcrt.locking(fd.fileno(), _msvcrt.LK_NBLCK, 1)
+                    return
+                except OSError:
+                    time.sleep(0.01)
+        else:
+            try:
+                fd.seek(0)
+                _msvcrt.locking(fd.fileno(), _msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+else:
+    import fcntl as _fcntl
+
+    def _flock(fd, exclusive: bool) -> None:
+        _fcntl.flock(fd, _fcntl.LOCK_EX if exclusive else _fcntl.LOCK_UN)
 
 logger = logging.getLogger(__name__)
 
@@ -182,7 +206,7 @@ class RoundLogger:
         # Acquire file lock for thread-safe write
         lock_fd = open(self._lock_path, "w")
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            _flock(lock_fd, exclusive=True)
 
             rounds = self._load_rounds()
 
@@ -202,7 +226,7 @@ class RoundLogger:
             return True
 
         finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            _flock(lock_fd, exclusive=False)
             lock_fd.close()
 
     def get_all_rounds(self) -> list[dict]:
@@ -300,7 +324,7 @@ class RoundLogger:
 
         lock_fd = open(lock_path, "w")
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            _flock(lock_fd, exclusive=True)
 
             all_snapshots = self._load_pool_snapshots(json_path)
 
@@ -326,5 +350,5 @@ class RoundLogger:
             return True
 
         finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            _flock(lock_fd, exclusive=False)
             lock_fd.close()

@@ -23,11 +23,35 @@ PancakeSwap Prediction V2 (BNB/USD, BSC):
 import json
 import logging
 import os
+import sys
 import time
 import hashlib
-import fcntl
 from pathlib import Path
 from contextlib import contextmanager
+
+if sys.platform == "win32":
+    import msvcrt as _msvcrt
+
+    def _flock(fd, exclusive: bool) -> None:
+        fd.seek(0)
+        if exclusive:
+            while True:
+                try:
+                    _msvcrt.locking(fd.fileno(), _msvcrt.LK_NBLCK, 1)
+                    return
+                except OSError:
+                    time.sleep(0.01)
+        else:
+            try:
+                fd.seek(0)
+                _msvcrt.locking(fd.fileno(), _msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+else:
+    import fcntl as _fcntl
+
+    def _flock(fd, exclusive: bool) -> None:
+        _fcntl.flock(fd, _fcntl.LOCK_EX if exclusive else _fcntl.LOCK_UN)
 from dataclasses import dataclass, asdict
 from typing import Optional
 
@@ -49,11 +73,11 @@ BSC_RPC_URLS = [
 def _file_lock(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a+") as fh:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        _flock(fh, exclusive=True)
         try:
             yield fh
         finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            _flock(fh, exclusive=False)
 
 # Minimal ABI — only the functions we call
 PANCAKE_ABI = [

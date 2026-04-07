@@ -1106,9 +1106,12 @@ class PolymarketBot:
         self._running = True
 
         # Set up graceful shutdown on Ctrl+C
-        loop = asyncio.get_event_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, self.stop)
+        if sys.platform == "win32":
+            signal.signal(signal.SIGINT, lambda s, f: self.stop())
+        else:
+            loop = asyncio.get_event_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, self.stop)
 
         # Re-configure logging: reduce console to WARNING now that dashboard is active
         setup_logging(self.config, dashboard_mode=True, strategy_key=self._strategy_key, trading_mode=self.mode)
@@ -1594,8 +1597,11 @@ class ParallelBot:
     async def run(self):
         self._running = True
         loop = asyncio.get_event_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, self.stop)
+        if sys.platform == "win32":
+            signal.signal(signal.SIGINT, lambda s, f: self.stop())
+        else:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, self.stop)
 
         setup_logging(self.config, dashboard_mode=True, strategy_key="parallel", trading_mode="paper")
 
