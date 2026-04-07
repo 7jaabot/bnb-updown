@@ -10,7 +10,13 @@
       "Bash(wsl -e bash -c \"cd /home/joris/projects/bnb-updown && git push origin master\")",
       "Bash(wsl -e bash -c \"cd /home/joris/projects/bnb-updown && git status\")",
       "Bash(wsl -e bash -c \"cd /home/joris/projects/bnb-updown && git diff\")",
-      "Bash(wsl -e bash -c 'cd /home/joris/projects/bnb-updown && git add .claude/settings.local.json CLAUDE.md && git commit -m \":*)"
+      "Bash(wsl -e bash -c 'cd /home/joris/projects/bnb-updown && git add .claude/settings.local.json CLAUDE.md && git commit -m \":*)",
+      "Bash(node scripts/sync-sheets.js)",
+      "Read(///wsl.localhost/Ubuntu//**)",
+      "Bash(wslpath -u \"\\\\\\\\\\\\\\\\wsl.localhost\\\\\\\\Ubuntu\\\\\\\\home\\\\\\\\joris\\\\\\\\projects\\\\\\\\bnb-updown\")",
+      "Bash(node \"\\\\\\\\\\\\\\\\wsl.localhost\\\\\\\\Ubuntu\\\\\\\\home\\\\\\\\joris\\\\\\\\projects\\\\\\\\bnb-updown\\\\\\\\scripts\\\\\\\\sync-sheets.js\")",
+      "Read(//c/Users/Joris/.claude/**)",
+      "Read(//c/Users/Joris/**)"
     ]
   }
 }
