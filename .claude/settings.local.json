@@ -5,7 +5,12 @@
       "mcp__scheduled-tasks__list_scheduled_tasks",
       "Bash(git config:*)",
       "Bash(git add:*)",
-      "Bash(git commit -m ':*)"
+      "Bash(git commit -m ':*)",
+      "Bash(gh pr:*)",
+      "Bash(wsl -e bash -c \"cd /home/joris/projects/bnb-updown && git push origin master\")",
+      "Bash(wsl -e bash -c \"cd /home/joris/projects/bnb-updown && git status\")",
+      "Bash(wsl -e bash -c \"cd /home/joris/projects/bnb-updown && git diff\")",
+      "Bash(wsl -e bash -c 'cd /home/joris/projects/bnb-updown && git add .claude/settings.local.json CLAUDE.md && git commit -m \":*)"
     ]
   }
 }
