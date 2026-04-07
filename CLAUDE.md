@@ -6,11 +6,11 @@
 Bot de trading sur PancakeSwap Prediction V2 (BNB/USD, BSC) — 17 stratégies + mode combiné, paper et live.
 
 ## Repo
-- Local : `~/projects/bnb-updown`
+- Local : `C:\Users\Joris\projects\bnb-updown`
 - GitHub : `7jaabot/bnb-updown` (branche `master`)
 
 ## Lancement
-Double-clic sur `_start_wsl.bat` → WSL → menu mode (1=live, 2=paper) → menu stratégie :
+Double-clic sur `_start.bat` → Windows natif → menu mode (1=live, 2=paper) → menu stratégie :
 - **[0]** → lance les 17 stratégies en parallèle (ParallelBot, un seul process)
 - **[1-17]** → stratégie individuelle
 - **"5,11,7"** → combined strategy (consensus)
