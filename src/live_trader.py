@@ -454,6 +454,11 @@ class LiveTrader:
             gas_estimate = fn.estimate_gas({"from": self._wallet_address, "value": bet_wei})
             gas_limit = int(gas_estimate * 1.2)
         except Exception as e:
+            err_str = str(e).lower()
+            if "execution reverted" in err_str or "revert" in err_str:
+                # Contract revert (e.g. "Round not bettable") — do not send TX
+                logger.error(f"Contract reverted for {fn_name}: {e} — aborting TX")
+                raise
             logger.warning(f"Gas estimation failed for {fn_name}: {e} — using 200000")
             gas_limit = 200_000
         tx = fn.build_transaction({
@@ -681,6 +686,28 @@ class LiveTrader:
             logger.warning(f"verify_transaction: receipt not yet available ({e})")
             return None
 
+    def cancel_failed_tx(self, tx_hash: str):
+        """
+        Mark a trade as TX_FAILED and remove it from pending.
+        Called when verify_transaction confirms the TX reverted on-chain.
+        """
+        for trade in list(self._pending_trades):
+            if trade.tx_hash == tx_hash:
+                trade.tx_status = "failed"
+                trade.outcome = "TX_FAILED"
+                trade.pnl_usdc = 0.0
+                trade.timestamp_exit = time.time()
+                self._pending_trades.remove(trade)
+                self.metrics.pending -= 1
+                self.metrics.total_trades -= 1
+                self.metrics.total_wagered -= trade.position_size_usdc
+                self._save_trades()
+                logger.warning(
+                    f"🚫 Trade {trade.trade_id} cancelled — TX failed on-chain: {tx_hash}"
+                )
+                return
+        logger.warning(f"cancel_failed_tx: no pending trade found with tx_hash={tx_hash}")
+
     # ─── Core Interface (mirrors PaperTrader) ────────────────────────────────
 
     def enter_trade(self, signal, window) -> Optional[LiveTrade]:
@@ -864,6 +891,20 @@ class LiveTrader:
         resolved_count = 0
 
         for trade in list(self._pending_trades):
+            # Skip trades whose TX failed on-chain
+            if trade.tx_status == "failed":
+                logger.warning(
+                    f"resolve_pending_on_startup: skipping {trade.trade_id} — TX failed on-chain"
+                )
+                trade.outcome = "TX_FAILED"
+                trade.pnl_usdc = 0.0
+                trade.timestamp_exit = trade.timestamp_exit or time.time()
+                self.metrics.pending -= 1
+                self.metrics.total_trades -= 1
+                self.metrics.total_wagered -= trade.position_size_usdc
+                resolved_count += 1
+                continue
+
             try:
                 round_data = self._pancake_client.get_round_by_epoch(trade.epoch)
             except Exception as e:
@@ -1057,6 +1098,20 @@ class LiveTrader:
         for trade in self._pending_trades:
             if trade.window_index != window_index:
                 still_pending.append(trade)
+                continue
+
+            # Safety net: skip trades whose TX failed on-chain
+            if trade.tx_status == "failed":
+                logger.warning(
+                    f"🚫 Skipping trade {trade.trade_id} — TX failed on-chain (tx={trade.tx_hash})"
+                )
+                trade.outcome = "TX_FAILED"
+                trade.pnl_usdc = 0.0
+                trade.timestamp_exit = time.time()
+                self.metrics.pending -= 1
+                self.metrics.total_trades -= 1
+                self.metrics.total_wagered -= trade.position_size_usdc
+                resolved.append(trade)
                 continue
 
             if trade.side == "YES":
