@@ -622,8 +622,15 @@ class PolymarketBot:
                     self._sniper_verified = True
                     if result is True:
                         self.dashboard.log(f"✅ Sniper TX confirmed: {self._sniper_tx_hash}")
+                        # Update trade tx_status
+                        for t in self.trader._pending_trades:
+                            if t.tx_hash == self._sniper_tx_hash:
+                                t.tx_status = "confirmed"
+                                break
                     elif result is False:
                         self.dashboard.log(f"❌ Sniper TX FAILED: {self._sniper_tx_hash}")
+                        # Mark trade as failed and remove from pending
+                        self.trader.cancel_failed_tx(self._sniper_tx_hash)
                     else:
                         self.dashboard.log(f"⏳ Sniper TX pending: {self._sniper_tx_hash}")
             else:
@@ -701,6 +708,7 @@ class PolymarketBot:
                 # Dynamic sizing: 5% of wallet, min $10, capped by pool later
                 wallet_bnb = self.trader.get_bnb_balance()
                 wallet_usdc = wallet_bnb * bnb_price
+                self.trader.metrics.bankroll = wallet_usdc
                 bet_usdc = max(
                     self.config.get("strategy", {}).get("min_position_usdc", 10.0),
                     wallet_usdc * 0.05,
