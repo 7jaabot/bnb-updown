@@ -664,15 +664,14 @@ async function refreshCrowdAccuracy(sheets, existingTabs) {
       poolActivityRows.push(['When is the pool final?']);
       poolActivityRows.push(['Threshold', '% Epochs Pool Already Final', 'Recommendation']);
       for (const sec of [1, 2, 3, 4, 5, 7, 10]) {
-        const pct     = r2(lastChangeSecs.filter(x => x >= sec).length / n * 100);
-        const settled = 100 - pct;
+        const pct = r2(lastChangeSecs.filter(x => x >= sec).length / n * 100);
         let reco = '';
-        if (settled >= 95)      reco = '✅ Very safe to bet here';
-        else if (settled >= 80) reco = '✅ Safe';
-        else if (settled >= 60) reco = '⚠️ Pool still moves sometimes';
-        else if (settled >= 40) reco = '⚠️ Pool often still changing';
-        else                    reco = '❌ Too early — pool still actively changing';
-        poolActivityRows.push([`T-${sec}s`, settled + '%', reco]);
+        if (pct >= 95)      reco = '✅ Very safe to bet here';
+        else if (pct >= 80) reco = '✅ Safe';
+        else if (pct >= 60) reco = '⚠️ Pool still moves sometimes';
+        else if (pct >= 40) reco = '⚠️ Pool often still changing';
+        else                reco = '❌ Too early — pool still actively changing';
+        poolActivityRows.push([`T-${sec}s`, pct + '%', reco]);
       }
       poolActivityRows.push([]);
 
