@@ -438,7 +438,7 @@ class LiveTrader:
                 rec["updated_at"] = time.time()
                 self._save_coordination_state(state)
 
-    def _build_signed_transaction(self, side: str, epoch: int, bet_bnb: float, gas_price: Optional[int] = None, nonce: Optional[int] = None):
+    def _build_signed_transaction(self, side: str, epoch: int, bet_bnb: float, gas_price: Optional[int] = None, nonce: Optional[int] = None, gas_limit: Optional[int] = None):
         bet_wei = int(bet_bnb * 1e18)
         if side == "YES":
             fn = self._contract.functions.betBull(epoch)
@@ -450,17 +450,17 @@ class LiveTrader:
             gas_price = self._estimate_gas_price()
         if nonce is None:
             nonce = self._w3.eth.get_transaction_count(self._wallet_address, "pending")
-        try:
-            gas_estimate = fn.estimate_gas({"from": self._wallet_address, "value": bet_wei})
-            gas_limit = int(gas_estimate * 1.2)
-        except Exception as e:
-            err_str = str(e).lower()
-            if "execution reverted" in err_str or "revert" in err_str:
-                # Contract revert (e.g. "Round not bettable") — do not send TX
-                logger.error(f"Contract reverted for {fn_name}: {e} — aborting TX")
-                raise
-            logger.warning(f"Gas estimation failed for {fn_name}: {e} — using 200000")
-            gas_limit = 200_000
+        if gas_limit is None:
+            try:
+                gas_estimate = fn.estimate_gas({"from": self._wallet_address, "value": bet_wei})
+                gas_limit = int(gas_estimate * 1.2)
+            except Exception as e:
+                err_str = str(e).lower()
+                if "execution reverted" in err_str or "revert" in err_str:
+                    logger.error(f"Contract reverted for {fn_name}: {e} — aborting TX")
+                    raise
+                logger.warning(f"Gas estimation failed for {fn_name}: {e} — using 200000")
+                gas_limit = 200_000
         tx = fn.build_transaction({
             "from": self._wallet_address,
             "value": bet_wei,
@@ -624,6 +624,7 @@ class LiveTrader:
                     bet_bnb=bet_bnb,
                     gas_price=prepared.get("gas_price"),
                     nonce=nonce,
+                    gas_limit=prepared.get("gas_limit"),
                 )
             except Exception as e:
                 logger.error(f"fire_transaction: signing failed for side={side}: {e}")
