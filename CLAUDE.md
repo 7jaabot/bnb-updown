@@ -31,10 +31,10 @@ Double-clic sur `_start.bat` → Windows natif → menu mode (1=live, 2=paper) �
 ## Mode Sniper
 Architecture 3 phases par epoch :
 - **Phase 1 (T-20s→T-3s)** : prefetch données lentes en parallèle (ThreadPoolExecutor)
-- **Phase 2 (T-3s→T-2s)** : un poll on-chain frais → evaluate 17 stratégies → fire TX
+- **Phase 2 (T-3s→T-1s)** : un poll on-chain frais → evaluate 17 stratégies → fire TX
 - **Phase 3 (après lock)** : vérifier confirmation TX (live mode)
 - Poll interval : 1s pendant entry window, 5s en dehors
-- Config : `sniper_window_seconds: 3`, `min_seconds_before_lock: 2`
+- Config : `sniper_window_seconds: 3`, `min_seconds_before_lock: 1`
 
 ## Position Sizing
 - Flat $10 par trade, pas de Kelly
@@ -85,7 +85,7 @@ max_pool_pct: 0.10
 edge_threshold: 0.10
 entry_window_seconds: 20
 sniper_window_seconds: 3
-min_seconds_before_lock: 2
+min_seconds_before_lock: 1
 use_fair_odds: true
 ```
 
