@@ -652,8 +652,9 @@ class LiveTrader:
         self._last_fired_epoch = epoch
         self._last_fired_bet_bnb = bet_bnb
 
+        fired_ts = int(time.time())
         logger.info(
-            f"🚀 FIRED {fn_name}(epoch={epoch}) — tx={tx_hash_hex} | bet={bet_bnb:.6f} BNB | nonce={nonce}"
+            f"🚀 FIRED {fn_name}(epoch={epoch}) — tx={tx_hash_hex} | bet={bet_bnb:.6f} BNB | nonce={nonce} | ts={fired_ts}"
         )
         return tx_hash_hex
 
