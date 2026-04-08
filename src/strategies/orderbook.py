@@ -39,6 +39,17 @@ class OrderBookStrategy(BaseStrategy):
     def name(self) -> str:
         return "📊 Order Book Imbalance"
 
+    def prefetch(self, prices: list[float], epoch=None) -> None:
+        """Pre-fetch order book imbalance and cache it for the sniper window."""
+        super().prefetch(prices, epoch)
+        logger.debug("OrderBook: prefetching imbalance...")
+        imbalance = self._get_averaged_imbalance()
+        if imbalance is not None:
+            self._prefetch_cache["imbalance"] = imbalance
+            logger.info(f"OrderBook prefetch: imbalance={imbalance:.4f}")
+        else:
+            logger.warning("OrderBook prefetch: failed to fetch order book")
+
     def _fetch_weighted_imbalance(self) -> Optional[float]:
         """
         Fetch order book and compute distance-weighted imbalance.
@@ -134,7 +145,10 @@ class OrderBookStrategy(BaseStrategy):
         if not window.is_entry_window and window.seconds_remaining > self.entry_window_seconds:
             return None
 
-        imbalance = self._get_averaged_imbalance()
+        if "imbalance" in self._prefetch_cache:
+            imbalance = self._prefetch_cache.pop("imbalance")
+        else:
+            imbalance = self._get_averaged_imbalance()
         if imbalance is None:
             self.last_skip_reason = "⏸ Could not fetch order book"
             return None
