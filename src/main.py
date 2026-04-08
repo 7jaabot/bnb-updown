@@ -448,13 +448,13 @@ class PolymarketBot:
         self._last_poll_ts: float = 0.0  # when we last polled the contract
         self._in_entry_window: bool = False  # whether we're currently in entry window
         self._poll_interval = config.get("polymarket", {}).get("poll_interval_seconds", 5)
-        self._min_seconds_before_lock = config.get("strategy", {}).get("min_seconds_before_lock", 4)
+        self._min_seconds_before_lock = config.get("strategy", {}).get("min_seconds_before_lock", 2)
         self._live_ref = None  # Rich Live instance (set during run())
         self._live_close_ts: float | None = None  # close_ts of the live round (N-1)
 
         # Sniper phase state (per epoch)
         _scfg = config.get("strategy", {})
-        self._sniper_window_seconds: float = _scfg.get("sniper_window_seconds", 7)
+        self._sniper_window_seconds: float = _scfg.get("sniper_window_seconds", 4)
         self._prefetch_done: bool = False    # Phase 1 complete
         self._sniped_this_epoch: bool = False  # Phase 2 complete (sniper shot fired)
         self._sniper_tx_hash: str | None = None  # tx hash from fire_transaction (live mode)
@@ -1257,8 +1257,8 @@ class ParallelBot:
         self._live_ref = None
 
         _scfg = config.get("strategy", {})
-        self._sniper_window_seconds: float = _scfg.get("sniper_window_seconds", 7)
-        self._min_seconds_before_lock = _scfg.get("min_seconds_before_lock", 4)
+        self._sniper_window_seconds: float = _scfg.get("sniper_window_seconds", 4)
+        self._min_seconds_before_lock = _scfg.get("min_seconds_before_lock", 2)
         self._poll_interval = config.get("polymarket", {}).get("poll_interval_seconds", 5)
         # entry_window_seconds: take from first runner's strategy
         self._entry_window_seconds = (
