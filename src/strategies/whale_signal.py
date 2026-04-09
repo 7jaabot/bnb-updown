@@ -309,8 +309,8 @@ class WhaleSignalStrategy(BaseStrategy):
             )
         else:
             # Convertir le net_flow en P(Up)
-            # Normaliser : 1000 BNB de net flow ≈ ±5 % de biais
-            bias = net_flow / 20_000.0  # scale factor empirique
+            # Normaliser : 300 BNB de net flow ≈ ±10 % de biais
+            bias = net_flow / 3_000.0  # scale factor empirique
             p_up = max(0.01, min(0.99, 0.50 + bias))
             logger.info(
                 f"Whale: net_flow={net_flow:+.0f} BNB → bias={bias:+.4f} → "
