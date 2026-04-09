@@ -66,7 +66,7 @@ Architecture 3 phases par epoch :
 12. Market Regime Adaptive — Hurst exponent
 13. BTC/ETH Correlation Arbitrage — lag correlation
 14. Fear & Greed Micro — MFI basé sur range 24h
-15. Whale On-Chain Signal — BSC txs >1000 BNB
+15. Whale On-Chain Signal — BSC txs >100 BNB, scale 3k
 16. Bollinger Band Squeeze — squeeze + breakout
 17. LLM Price Action — Groq/Llama 3.3-70B (expérimental, rate limited)
 
@@ -89,6 +89,8 @@ min_seconds_before_lock: 2
 use_fair_odds: true
 oi_delta_threshold: 0.0003
 gas_price_buffer_pct: 0.20
+whale_min_bnb: 100
+whale_lookback_blocks: 20
 ```
 
 ## Prochaines étapes
