@@ -24,7 +24,7 @@
     "funding_rate_positive_threshold": 0.0001,
     "funding_rate_negative_threshold": -0.0001,
     "funding_rate_url": "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BNBUSDT",
-    "oi_delta_threshold": 0.005,
+    "oi_delta_threshold": 0.0003,
     "oi_period": "5m",
     "liquidation_min_volume_usdt": 100000,
     "liquidation_lookback_minutes": 5,
@@ -78,7 +78,7 @@
   "live_trading": {
     "enabled": false,
     "log_file": "logs/live/default/default.json",
-    "gas_price_buffer_pct": 0.10,
+    "gas_price_buffer_pct": 0.20,
     "auto_claim": true
   },
   "logging": {
