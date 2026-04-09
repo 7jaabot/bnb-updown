@@ -1,6 +1,6 @@
 # bnb-updown
 
-## Statut : ACTIF (paper trading, 17 stratégies en parallèle)
+## Statut : ACTIF (paper + live trading, 17 stratégies en parallèle)
 
 ## Description
 Bot de trading sur PancakeSwap Prediction V2 (BNB/USD, BSC) — 17 stratégies + mode combiné, paper et live.
@@ -87,6 +87,8 @@ entry_window_seconds: 20
 sniper_window_seconds: 4
 min_seconds_before_lock: 2
 use_fair_odds: true
+oi_delta_threshold: 0.0003
+gas_price_buffer_pct: 0.20
 ```
 
 ## Prochaines étapes
