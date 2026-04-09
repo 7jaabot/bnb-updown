@@ -823,8 +823,7 @@ class PolymarketBot:
                         self._traded_this_epoch = True
 
                         # Record the trade (without waiting for receipt)
-                        bnb_price = self.binance.last_price or 600.0
-                        bet_bnb = signal.position_size_usdc / bnb_price
+                        bet_bnb = self.trader._last_fired_bet_bnb
                         from live_trader import LiveTrade
                         import time as _time
                         self._trade_counter = getattr(self, '_trade_counter', 0) + 1
