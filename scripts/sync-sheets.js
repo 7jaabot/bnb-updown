@@ -935,14 +935,20 @@ async function refreshEpochMap(sheets, existingTabs) {
   // ── 📊 Consensus by count + Portfolio aggregate (I column, top) ─────
   const midRows = [];
 
-  // Block 1: Consensus WR by number of agreeing strategies
-  midRows.push(['📊 CONSENSUS BY COUNT']);
+  // Only count strategies with individual WR > 50%
+  const winningStrats = activeStrats.filter(s => {
+    const stats = stratStats.find(row => row[0] === s);
+    return stats && stats[3] > 50;
+  });
+
+  // Block 1: Consensus WR by number of agreeing strategies (WR>50% only)
+  midRows.push([`📊 CONSENSUS BY COUNT (${winningStrats.length} strategies with WR>50% only)`]);
   midRows.push(['Min Strategies Agreeing', 'Epochs', 'Wins', 'Win Rate %', 'PnL ($10/trade)']);
 
-  for (let minAgree = 2; minAgree <= activeStrats.length; minAgree++) {
+  for (let minAgree = 2; minAgree <= winningStrats.length; minAgree++) {
     let epochs = 0, wins = 0;
     for (const epoch of sortedEpochs) {
-      const sides = activeStrats.map(s => stratData[s]?.[epoch]?.side).filter(Boolean);
+      const sides = winningStrats.map(s => stratData[s]?.[epoch]?.side).filter(Boolean);
       if (sides.length < minAgree) continue;
       const upCount = sides.filter(s => s === 'UP').length;
       const downCount = sides.filter(s => s === 'DOWN').length;
