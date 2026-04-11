@@ -79,7 +79,10 @@
     "enabled": false,
     "log_file": "logs/live/default/default.json",
     "gas_price_buffer_pct": 0.20,
-    "auto_claim": true
+    "auto_claim": true,
+    "drawdown_pct_limit": 0.50,
+    "min_balance_usdc": 50.0,
+    "drawdown_cooldown_minutes": 60
   },
   "logging": {
     "level": "INFO",

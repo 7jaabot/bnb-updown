@@ -262,11 +262,84 @@ class LiveTrader:
         self._coordination_dir = Path(__file__).parent.parent / "logs" / "live" / ".coordination"
         self._wallet_key: Optional[str] = None
 
+        # Drawdown circuit breaker
+        self._cfg_live = cfg_live
+        self._peak_balance_usdc: float = 0.0
+        self._drawdown_triggered: bool = False
+        self._drawdown_triggered_at: Optional[float] = None
+
         # Load .env and init
         self._load_env()
         self._init_web3()
+        self._acquire_instance_lock()
         self._load_trades()
         self._reset_daily_tracking()
+
+    # ─── Instance Guard ──────────────────────────────────────────────────────
+
+    def _acquire_instance_lock(self):
+        """
+        Ensure only one LIVE instance runs per wallet.
+        Uses a PID file in the coordination directory.
+        """
+        if not self._wallet_key:
+            return
+
+        self._coordination_dir.mkdir(parents=True, exist_ok=True)
+        self._pid_lock_path = self._coordination_dir / f"wallet-{self._wallet_key}.pid"
+
+        if self._pid_lock_path.exists():
+            try:
+                existing_pid = int(self._pid_lock_path.read_text().strip())
+                if self._is_process_alive(existing_pid):
+                    raise RuntimeError(
+                        f"Another LIVE instance (PID {existing_pid}) is already running on wallet "
+                        f"{self._wallet_address}. Kill it first or wait for it to exit.\n"
+                        f"PID file: {self._pid_lock_path}"
+                    )
+                else:
+                    logger.warning(
+                        f"Stale PID file found (PID {existing_pid} is dead) — taking over"
+                    )
+            except ValueError:
+                logger.warning("Corrupt PID file — overwriting")
+
+        self._pid_lock_path.write_text(str(os.getpid()))
+        import atexit
+        atexit.register(self._release_instance_lock)
+        logger.info(f"Instance lock acquired (PID {os.getpid()}) for wallet {self._wallet_key}")
+
+    def _release_instance_lock(self):
+        """Remove PID file on clean shutdown."""
+        try:
+            if hasattr(self, '_pid_lock_path') and self._pid_lock_path.exists():
+                stored_pid = self._pid_lock_path.read_text().strip()
+                if stored_pid == str(os.getpid()):
+                    self._pid_lock_path.unlink()
+                    logger.info(f"Instance lock released (PID {os.getpid()})")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_process_alive(pid: int) -> bool:
+        """Check if a process with the given PID is running."""
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                handle = kernel32.OpenProcess(0x100000, False, pid)  # SYNCHRONIZE
+                if handle:
+                    kernel32.CloseHandle(handle)
+                    return True
+                return False
+            except Exception:
+                return False
+        else:
+            try:
+                os.kill(pid, 0)
+                return True
+            except OSError:
+                return False
 
     # ─── Environment & Web3 Setup ────────────────────────────────────────────
 
@@ -390,18 +463,40 @@ class LiveTrader:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(state, indent=2, sort_keys=True))
 
+    # Entries with status "sent" older than this are considered stale (dead process)
+    STALE_SENT_TIMEOUT = 300  # 5 minutes
+
+    def _is_stale_entry(self, rec: dict) -> bool:
+        """Check if a coordination entry is stale (from a dead process)."""
+        if rec.get("status") == "confirmed":
+            return False  # confirmed entries are never stale
+        if rec.get("status") == "sent":
+            age = time.time() - rec.get("updated_at", 0)
+            return age > self.STALE_SENT_TIMEOUT
+        return False
+
     def _epoch_already_claimed(self, epoch: int) -> bool:
         with _file_lock(self._coordination_dir / f"wallet-{self._wallet_key}.lock"):
             state = self._load_coordination_state()
             rec = state.get("epochs", {}).get(str(epoch))
-            return bool(rec and rec.get("status") in {"prepared", "sent", "confirmed", "pending"})
+            if not rec:
+                return False
+            if rec.get("status") not in {"prepared", "sent", "confirmed", "pending"}:
+                return False
+            if self._is_stale_entry(rec):
+                logger.info(
+                    f"Stale coordination entry for epoch {epoch} "
+                    f"(pid={rec.get('instance_id')}, age={time.time() - rec.get('updated_at', 0):.0f}s) — allowing reclaim"
+                )
+                return False
+            return True
 
     def _claim_epoch(self, epoch: int, side: str, bet_bnb: float, stage: str) -> bool:
         with _file_lock(self._coordination_dir / f"wallet-{self._wallet_key}.lock"):
             state = self._load_coordination_state()
             epochs = state.setdefault("epochs", {})
             rec = epochs.get(str(epoch))
-            if rec and rec.get("status") in {"prepared", "sent", "confirmed", "pending"}:
+            if rec and rec.get("status") in {"prepared", "sent", "confirmed", "pending"} and not self._is_stale_entry(rec):
                 logger.warning(
                     f"Epoch {epoch} already claimed by {rec.get('instance_id')} "
                     f"({rec.get('side')} | {rec.get('status')}) — skipping"
@@ -478,6 +573,21 @@ class LiveTrader:
 
         Returns True if safe to trade, False otherwise.
         """
+        # ── Drawdown circuit breaker ─────────────────────────────────────────
+        if self._drawdown_triggered:
+            cooldown = self._cfg_live.get("drawdown_cooldown_minutes", 60) * 60
+            elapsed = time.time() - (self._drawdown_triggered_at or 0)
+            if elapsed < cooldown:
+                remaining = int((cooldown - elapsed) / 60)
+                logger.warning(
+                    f"🛑 CIRCUIT BREAKER active — cooldown {remaining}min remaining"
+                )
+                return False
+            else:
+                # Cooldown elapsed — re-evaluate
+                self._drawdown_triggered = False
+                logger.info("Circuit breaker cooldown elapsed — re-evaluating balance...")
+
         # BNB balance check
         bet_bnb = position_size_usdc / bnb_price
         gas_reserve_bnb = 0.005  # ~0.005 BNB for gas
@@ -490,6 +600,31 @@ class LiveTrader:
                 f"need {required_bnb:.6f} (bet={bet_bnb:.6f} + gas={gas_reserve_bnb:.6f})"
             )
             return False
+
+        # ── Drawdown checks ──────────────────────────────────────────────────
+        current_usdc = current_bnb * bnb_price
+        self._peak_balance_usdc = max(self._peak_balance_usdc, current_usdc)
+
+        min_balance = self._cfg_live.get("min_balance_usdc", 50.0)
+        if current_usdc < min_balance:
+            logger.error(
+                f"🛑 CIRCUIT BREAKER: balance ${current_usdc:.2f} below minimum ${min_balance:.2f} — halting trading"
+            )
+            self._drawdown_triggered = True
+            self._drawdown_triggered_at = time.time()
+            return False
+
+        drawdown_limit = self._cfg_live.get("drawdown_pct_limit", 0.50)
+        if self._peak_balance_usdc > 0:
+            drawdown = 1.0 - (current_usdc / self._peak_balance_usdc)
+            if drawdown >= drawdown_limit:
+                logger.error(
+                    f"🛑 CIRCUIT BREAKER: {drawdown:.1%} drawdown from peak "
+                    f"${self._peak_balance_usdc:.2f} → ${current_usdc:.2f} — halting trading"
+                )
+                self._drawdown_triggered = True
+                self._drawdown_triggered_at = time.time()
+                return False
 
         return True
 
@@ -609,7 +744,7 @@ class LiveTrader:
         with _file_lock(lock_path):
             state = self._load_coordination_state()
             rec = state.setdefault("epochs", {}).get(str(epoch))
-            if rec and rec.get("status") in {"prepared", "sent", "confirmed", "pending"}:
+            if rec and rec.get("status") in {"prepared", "sent", "confirmed", "pending"} and not self._is_stale_entry(rec):
                 logger.warning(
                     f"fire_transaction: epoch {epoch} already claimed by {rec.get('instance_id')} "
                     f"({rec.get('side')} | {rec.get('status')}) — aborting"
@@ -658,6 +793,17 @@ class LiveTrader:
         )
         return tx_hash_hex
 
+    def _mark_epoch_confirmed(self, epoch: int, tx_hash: str) -> None:
+        """Update coordination state to 'confirmed' after on-chain confirmation."""
+        with _file_lock(self._coordination_dir / f"wallet-{self._wallet_key}.lock"):
+            state = self._load_coordination_state()
+            rec = state.setdefault("epochs", {}).get(str(epoch))
+            if rec:
+                rec["status"] = "confirmed"
+                rec["tx_hash"] = tx_hash
+                rec["updated_at"] = time.time()
+                self._save_coordination_state(state)
+
     def verify_transaction(self, timeout: int = 30) -> Optional[bool]:
         """
         Phase 3 (verify): Check if the last fired transaction was confirmed.
@@ -673,6 +819,8 @@ class LiveTrader:
             logger.warning("verify_transaction: no fired TX to verify")
             return None
 
+        epoch = getattr(self, '_last_fired_epoch', None)
+
         try:
             receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash_hex, timeout=timeout)
             if receipt.status == 1:
@@ -680,9 +828,13 @@ class LiveTrader:
                     f"✅ Transaction confirmed: {tx_hash_hex} | "
                     f"block={receipt.blockNumber}"
                 )
+                if epoch:
+                    self._mark_epoch_confirmed(epoch, tx_hash_hex)
                 return True
             else:
                 logger.error(f"❌ Transaction FAILED on-chain: {tx_hash_hex}")
+                if epoch:
+                    self._release_epoch_claim(epoch, "failed")
                 return False
         except Exception as e:
             logger.warning(f"verify_transaction: receipt not yet available ({e})")
@@ -754,7 +906,7 @@ class LiveTrader:
         with _file_lock(lock_path):
             state = self._load_coordination_state()
             rec = state.setdefault("epochs", {}).get(str(epoch))
-            if rec and rec.get("status") in {"prepared", "sent", "confirmed", "pending"}:
+            if rec and rec.get("status") in {"prepared", "sent", "confirmed", "pending"} and not self._is_stale_entry(rec):
                 logger.warning(
                     f"enter_trade: epoch {epoch} already claimed by {rec.get('instance_id')} "
                     f"({rec.get('side')} | {rec.get('status')}) — aborting duplicate live trade"
@@ -1021,6 +1173,73 @@ class LiveTrader:
                 self.claim_winnings(unclaimed_win_epochs)
             else:
                 logger.info("resolve_pending_on_startup: no unclaimed WIN epochs found.")
+
+        # ── Cross-instance sweep: claim wins from ANY instance on this wallet ──
+        if self.auto_claim:
+            self.sweep_unclaimed_wins()
+
+    def sweep_unclaimed_wins(self):
+        """
+        Scan the shared coordination file for ALL epochs (any instance, any PID)
+        and claim any that are claimable on-chain. Also prunes entries older than 24h.
+        """
+        if not self._contract or not self._wallet_address:
+            return
+
+        lock_path = self._coordination_dir / f"wallet-{self._wallet_key}.lock"
+        with _file_lock(lock_path):
+            state = self._load_coordination_state()
+            epochs_data = state.get("epochs", {})
+
+        if not epochs_data:
+            return
+
+        now = time.time()
+        max_age = 86400  # 24 hours
+
+        claimable_epochs = []
+        prunable_epochs = []
+
+        for epoch_str, rec in epochs_data.items():
+            age = now - rec.get("updated_at", 0)
+            epoch = int(epoch_str)
+
+            # Prune entries older than 24h
+            if age > max_age:
+                prunable_epochs.append(epoch_str)
+                # Still check if claimable before pruning
+                try:
+                    if self._contract.functions.claimable(epoch, self._wallet_address).call():
+                        claimable_epochs.append(epoch)
+                    elif self._contract.functions.refundable(epoch, self._wallet_address).call():
+                        claimable_epochs.append(epoch)
+                except Exception:
+                    pass
+                continue
+
+            # Check recent entries with status "sent" or "confirmed"
+            if rec.get("status") in {"sent", "confirmed"}:
+                try:
+                    if self._contract.functions.claimable(epoch, self._wallet_address).call():
+                        claimable_epochs.append(epoch)
+                    elif self._contract.functions.refundable(epoch, self._wallet_address).call():
+                        claimable_epochs.append(epoch)
+                except Exception:
+                    pass
+
+        # Claim if any found
+        if claimable_epochs:
+            logger.info(f"sweep_unclaimed_wins: found {len(claimable_epochs)} claimable epoch(s) — claiming...")
+            self.claim_winnings(claimable_epochs)
+
+        # Prune old entries
+        if prunable_epochs:
+            with _file_lock(lock_path):
+                state = self._load_coordination_state()
+                for epoch_str in prunable_epochs:
+                    state.get("epochs", {}).pop(epoch_str, None)
+                self._save_coordination_state(state)
+                logger.info(f"sweep_unclaimed_wins: pruned {len(prunable_epochs)} stale coordination entries (>24h)")
 
     def _fetch_round_pnl(self, trade, bnb_price: float) -> tuple[float, float]:
         """
