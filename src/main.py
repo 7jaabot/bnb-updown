@@ -186,12 +186,51 @@ def prompt_edge_filter(strategy_label: str = "") -> 'EdgeFilter':
     return ef
 
 
+def _build_combined(config: dict, strategy_list: list, combo_str: str, combo_num: int = 0):
+    """
+    Parse a comma-separated combo string (e.g. "3,5,11") into a CombinedStrategy.
+    Prompts for edge filters interactively.
+
+    Returns CombinedStrategy or None on parse error.
+    """
+    from strategies.combined import CombinedStrategy
+
+    try:
+        indices = [int(x.strip()) - 1 for x in combo_str.split(",")]
+    except ValueError:
+        return None
+
+    if not (all(0 <= i < len(strategy_list) for i in indices) and len(indices) >= 2):
+        return None
+
+    strategies = []
+    edge_filters = {}
+    label = f" #{combo_num}" if combo_num else ""
+    print(f"\n  🔗 Combined Strategy{label} — configuring edge filters")
+    for idx in indices:
+        key, cls = strategy_list[idx]
+        strat = cls(config)
+        strategies.append((key, strat))
+        print(f"\n  ── {strat.name} ──")
+        ef = prompt_edge_filter(strat.name)
+        if ef.min_edge is not None or ef.max_edge is not None:
+            edge_filters[key] = ef
+
+    combined = CombinedStrategy(config, strategies, edge_filters)
+    print(f"\n  → {combined.name}")
+    if edge_filters:
+        for name, ef in edge_filters.items():
+            print(f"    Edge filter {name}: {ef}")
+    return combined
+
+
 def select_strategy_interactive(config: dict):
     """
     Display strategy selection menu and return either:
-      - None         → parallel mode (all 17 strategies, ParallelBot)
-      - CombinedStrategy → combined mode (comma-separated selection)
-      - BaseStrategy → single strategy mode
+      - None                  → parallel mode (all 17 strategies, ParallelBot)
+      - list[CombinedStrategy] → multi-combined mode (pipe-separated combos)
+      - CombinedStrategy      → single combined mode
+      - BaseStrategy          → single strategy mode
 
     Returns (result, is_parallel) where is_parallel=True means ParallelBot should be used.
     """
@@ -210,38 +249,40 @@ def select_strategy_interactive(config: dict):
             name = key
         print(f"  [{i}] {name}")
     print("=" * 55)
-    print("  Enter a number, or comma-separated for combined (e.g. 5,11,7)")
+    print("  Comma-separated for combined (e.g. 5,11,7)")
+    print("  Pipe-separated for multi-combined (e.g. 3,5,11|5,3,15|1,2,10,5)")
 
     while True:
         choice = input("Select strategy: ").strip()
 
-        # Check for comma-separated multi-select (combined strategy)
-        if "," in choice:
-            try:
-                indices = [int(x.strip()) - 1 for x in choice.split(",")]
-                if all(0 <= i < len(strategy_list) for i in indices) and len(indices) >= 2:
-                    # Combined strategy mode
-                    strategies = []
-                    edge_filters = {}
-                    print("\n  🔗 Combined Strategy — configuring edge filters")
-                    for idx in indices:
-                        key, cls = strategy_list[idx]
-                        strat = cls(config)
-                        strategies.append((key, strat))
-                        print(f"\n  ── {strat.name} ──")
-                        ef = prompt_edge_filter(strat.name)
-                        if ef.min_edge is not None or ef.max_edge is not None:
-                            edge_filters[key] = ef
+        # Multi-combined: pipe-separated combos (e.g. "3,5,11|5,3,15")
+        if "|" in choice:
+            combo_strings = [s.strip() for s in choice.split("|") if s.strip()]
+            if len(combo_strings) < 2:
+                print("  Need at least 2 combos separated by |")
+                continue
 
-                    combined = CombinedStrategy(config, strategies, edge_filters)
-                    print(f"\n  → {combined.name}")
-                    if edge_filters:
-                        for name, ef in edge_filters.items():
-                            print(f"    Edge filter {name}: {ef}")
-                    print()
-                    return combined, False
-            except ValueError:
-                pass
+            combos = []
+            for i, cs in enumerate(combo_strings, 1):
+                combined = _build_combined(config, strategy_list, cs, combo_num=i)
+                if combined is None:
+                    print(f"  Invalid combo #{i}: '{cs}'")
+                    break
+                combos.append(combined)
+            else:
+                # All parsed successfully
+                print(f"\n  → {len(combos)} combined strategies configured")
+                print()
+                return combos, False
+
+            continue
+
+        # Single combined: comma-separated (e.g. "5,11,7")
+        if "," in choice:
+            combined = _build_combined(config, strategy_list, choice)
+            if combined is not None:
+                print()
+                return combined, False
             print(f"  Invalid. Enter at least 2 numbers between 1-{len(strategy_list)}, separated by commas.")
             continue
 
@@ -333,9 +374,12 @@ def select_mode_interactive(config: dict):
             config["_is_paper"] = True
         return "parallel", None, None
 
-    # For CombinedStrategy, build a unique key with PID to allow parallel instances
+    # Build strategy key for log file paths
     from strategies.combined import CombinedStrategy
-    if isinstance(strategy, CombinedStrategy):
+    if isinstance(strategy, list):
+        # Multi-combined mode
+        strategy_key = f"multi_combined_{os.getpid()}"
+    elif isinstance(strategy, CombinedStrategy):
         sub_names = [s[0] for s in strategy.strategies]
         strategy_key = "combined_" + "_".join(sorted(sub_names)) + f"_{os.getpid()}"
     else:
@@ -406,11 +450,17 @@ class PolymarketBot:
             use_mock_on_failure=config.get("pancake", {}).get("use_mock_on_failure", True),
             timeout=config.get("pancake", {}).get("timeout_seconds", 8),
         )
-        if strategy is not None:
-            self.strategy = strategy
+
+        # Normalize strategy to a list for multi-combined support
+        if strategy is None:
+            self._strategies = [STRATEGIES["gbm"](config)]
+        elif isinstance(strategy, list):
+            self._strategies = strategy
         else:
-            # Fallback: default GBM strategy
-            self.strategy = STRATEGIES["gbm"](config)
+            self._strategies = [strategy]
+        # Keep self.strategy for backward compat (single strategy case / dashboard)
+        self.strategy = self._strategies[0]
+        self._is_multi_strategy = len(self._strategies) > 1
 
         # Share PancakeClient with trader for on-chain PnL resolution (live + paper)
         if hasattr(trader, '_pancake_client'):
@@ -431,7 +481,11 @@ class PolymarketBot:
         # Dashboard — imported here so Rich is only required when running the bot
         from dashboard import Dashboard
         self.dashboard = Dashboard(trader=trader, binance=self.binance, mode=mode)
-        self.dashboard._strategy_name = self.strategy.name
+        if self._is_multi_strategy:
+            combo_names = [s.name for s in self._strategies]
+            self.dashboard._strategy_name = f"Multi-Combined ({len(self._strategies)} combos)"
+        else:
+            self.dashboard._strategy_name = self.strategy.name
         # Store strategy key for logging
         self._strategy_key = next(
             (k for k, v in STRATEGIES.items() if isinstance(self.strategy, v)), ""
@@ -500,6 +554,17 @@ class PolymarketBot:
                 except Exception as e:
                     self.logger.debug(f"Balance refresh failed: {e}")
             await asyncio.sleep(30)
+
+    async def _periodic_claim_sweep(self):
+        """Periodically sweep for unclaimed wins across all instances (every 5 min)."""
+        while self._running:
+            await asyncio.sleep(300)  # 5 minutes
+            if self.mode == "live" and hasattr(self.trader, 'sweep_unclaimed_wins'):
+                try:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, self.trader.sweep_unclaimed_wins)
+                except Exception as e:
+                    self.logger.debug(f"Claim sweep failed: {e}")
 
     async def _update_chainlink_price(self):
         """Periodically fetch BNB/USD price from Chainlink oracle on BSC (same as PancakeSwap)."""
@@ -693,14 +758,24 @@ class PolymarketBot:
             )
             self._refresh_display()
 
-            # Run prefetch in executor so it doesn't block the event loop
-            try:
-                await loop.run_in_executor(
-                    None,
-                    lambda: self.strategy.prefetch(prices, epoch=current_epoch)
-                )
-            except Exception as e:
-                self.logger.warning(f"Prefetch failed (non-fatal): {e}")
+            # Run prefetch for all strategies (parallel if multi-combined)
+            if self._is_multi_strategy:
+                from concurrent.futures import ThreadPoolExecutor
+                def _prefetch_one(s):
+                    try:
+                        s.prefetch(prices, epoch=current_epoch)
+                    except Exception as e:
+                        self.logger.warning(f"Prefetch failed for {s.name} (non-fatal): {e}")
+                with ThreadPoolExecutor(max_workers=min(len(self._strategies), 8)) as executor:
+                    await loop.run_in_executor(None, lambda: list(executor.map(_prefetch_one, self._strategies)))
+            else:
+                try:
+                    await loop.run_in_executor(
+                        None,
+                        lambda: self.strategy.prefetch(prices, epoch=current_epoch)
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Prefetch failed (non-fatal): {e}")
 
             # For live mode: compute dynamic position size + pre-build and pre-sign both TXs
             if self.mode == "live" and hasattr(self.trader, 'prepare_transactions'):
@@ -713,8 +788,9 @@ class PolymarketBot:
                     self.config.get("strategy", {}).get("min_position_usdc", 10.0),
                     wallet_usdc * 0.05,
                 )
-                # Update strategy position_size_usdc so evaluate() uses it
-                self.strategy.position_size_usdc = bet_usdc
+                # Update all strategies' position_size_usdc so evaluate() uses it
+                for s in self._strategies:
+                    s.position_size_usdc = bet_usdc
                 bet_bnb = bet_usdc / bnb_price
                 self.logger.info(
                     f"💰 Live sizing: wallet={wallet_usdc:.2f} USDC | "
@@ -781,7 +857,8 @@ class PolymarketBot:
                 + (" [MOCK]" if round_data.is_mock else "")
             )
 
-            signal = self.strategy.evaluate(
+            # Evaluate all strategies (multi-combined: parallel + unanimity consensus)
+            eval_kwargs = dict(
                 prices=prices,
                 yes_price=round_data.yes_price_equiv,
                 window=window,
@@ -790,6 +867,45 @@ class PolymarketBot:
                 pool_bull_bnb=round_data.bull_bnb,
                 pool_bear_bnb=round_data.bear_bnb,
             )
+
+            if self._is_multi_strategy:
+                from concurrent.futures import ThreadPoolExecutor
+                def _eval_one(s):
+                    try:
+                        return s.evaluate(**eval_kwargs)
+                    except Exception as e:
+                        self.logger.error(f"Strategy {s.name} evaluate() error: {e}")
+                        return None
+
+                with ThreadPoolExecutor(max_workers=min(len(self._strategies), 8)) as executor:
+                    signals = list(executor.map(_eval_one, self._strategies))
+
+                # Unanimity consensus: all signals that fired must agree on direction
+                fired = [(self._strategies[i], sig) for i, sig in enumerate(signals) if sig is not None]
+                if fired:
+                    sides = set(sig.side for _, sig in fired)
+                    if len(sides) == 1:
+                        # Unanimous — use the first signal (all agree on direction)
+                        signal = fired[0][1]
+                        combo_names = [s.name for s, _ in fired]
+                        self.logger.info(
+                            f"Multi-combined consensus: {len(fired)}/{len(self._strategies)} combos → {signal.side} "
+                            f"(avg edge={sum(s.edge for _, s in fired)/len(fired):.3f})"
+                        )
+                    else:
+                        # Conflict — skip
+                        signal = None
+                        self.logger.warning(
+                            f"Multi-combined CONFLICT: {len(fired)} combos fired but directions disagree "
+                            f"({', '.join(f'{s.name}→{sig.side}' for s, sig in fired)}) — skipping"
+                        )
+                        self.dashboard.log(
+                            f"⚠️ Epoch #{current_epoch} | Multi-combined conflict — {len(fired)} combos disagree — SKIP"
+                        )
+                else:
+                    signal = None
+            else:
+                signal = self.strategy.evaluate(**eval_kwargs)
 
             self._sniped_this_epoch = True  # Only attempt once per epoch
 
@@ -1158,6 +1274,7 @@ class PolymarketBot:
                 self._run_main_loop(),
                 self._update_live_balance(),
                 self._update_chainlink_price(),
+                self._periodic_claim_sweep(),
             )
         finally:
             live.stop()
@@ -1746,7 +1863,9 @@ def main():
             return
 
         from strategies.combined import CombinedStrategy
-        if isinstance(strategy, CombinedStrategy):
+        if isinstance(strategy, list):
+            strategy_key = f"multi_combined_{os.getpid()}"
+        elif isinstance(strategy, CombinedStrategy):
             sub_names = [s[0] for s in strategy.strategies]
             strategy_key = "combined_" + "_".join(sorted(sub_names)) + f"_{os.getpid()}"
         else:
