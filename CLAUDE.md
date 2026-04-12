@@ -39,8 +39,9 @@ Architecture 3 phases par epoch :
 - Config : `sniper_window_seconds: 4`, `min_seconds_before_lock: 2`
 
 ## Position Sizing
-- Flat $10 par trade, pas de Kelly
-- Guards : min $5 (skip si en-dessous), max 10% bankroll, max 10% pool
+- **2% du bankroll** (wallet balance × BNB price en live, tracked bankroll en paper)
+- Guards : min $5 (skip si en-dessous), max 10% du pool total de l'epoch
+- Pas de Kelly, pas de flat sizing
 
 ## Logs / Trades
 - Structure : `logs/<mode>/<strategy>/<strategy>.json` + `.csv`
@@ -87,9 +88,8 @@ Architecture 3 phases par epoch :
 
 ## Config clés
 ```
-position_size_usdc: 10
+bankroll_pct: 0.02
 min_position_usdc: 5
-max_bankroll_pct: 0.10
 max_pool_pct: 0.10
 edge_threshold: 0.10
 entry_window_seconds: 20
