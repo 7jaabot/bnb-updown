@@ -777,27 +777,25 @@ class PolymarketBot:
                 except Exception as e:
                     self.logger.warning(f"Prefetch failed (non-fatal): {e}")
 
-            # For live mode: compute dynamic position size + pre-build and pre-sign both TXs
+            # For live mode: sync bankroll from wallet + pre-build and pre-sign both TXs
             if self.mode == "live" and hasattr(self.trader, 'prepare_transactions'):
                 bnb_price = self.binance.last_price
                 if not bnb_price:
                     self.logger.warning("No BNB price from Binance WS — skipping TX pre-sign")
                 else:
-                    # Dynamic sizing: 5% of wallet, min $10, capped by pool later
+                    # Sync bankroll from on-chain wallet balance
                     wallet_bnb = self.trader.get_bnb_balance()
                     wallet_usdc = wallet_bnb * bnb_price
                     self.trader.metrics.bankroll = wallet_usdc
-                    bet_usdc = max(
-                        self.config.get("strategy", {}).get("min_position_usdc", 10.0),
-                        wallet_usdc * 0.05,
-                    )
-                    # Update all strategies' position_size_usdc so evaluate() uses it
                     for s in self._strategies:
-                        s.position_size_usdc = bet_usdc
+                        s.bankroll = wallet_usdc
+                    # Estimate bet for TX pre-sign (actual sizing done in evaluate())
+                    bankroll_pct = self.config.get("strategy", {}).get("bankroll_pct", 0.05)
+                    bet_usdc = wallet_usdc * bankroll_pct
                     bet_bnb = bet_usdc / bnb_price
                     self.logger.info(
                         f"💰 Live sizing: wallet={wallet_usdc:.2f} USDC | "
-                        f"5%={wallet_usdc*0.05:.2f} | bet={bet_usdc:.2f} USDC ({bet_bnb:.6f} BNB)"
+                        f"{bankroll_pct:.0%}={bet_usdc:.2f} USDC ({bet_bnb:.6f} BNB)"
                     )
                     try:
                         ok = await loop.run_in_executor(

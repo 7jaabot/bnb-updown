@@ -23,15 +23,14 @@ class BaseStrategy(ABC):
     def __init__(self, config: dict):
         cfg = config.get("strategy", {})
         self.edge_threshold = cfg.get("edge_threshold", 0.10)
-        self.position_size_usdc = cfg.get("position_size_usdc", 10.0)
+        self.bankroll_pct = cfg.get("bankroll_pct", 0.02)
         self.entry_window_seconds = cfg.get("entry_window_seconds", 25)
         self.bankroll = cfg.get("starting_bankroll_usdc", 1000.0)
         self.last_skip_reason: Optional[str] = None
 
         # Position sizing guards
         self.min_position_usdc = cfg.get("min_position_usdc", 5.0)
-        self.max_bankroll_pct = cfg.get("max_bankroll_pct", 1.0)   # default: no cap
-        self.max_pool_pct = cfg.get("max_pool_pct", 1.0)           # default: no cap
+        self.max_pool_pct = cfg.get("max_pool_pct", 0.10)
 
         pcfg = config.get("pancake", {})
         self.min_pool_bnb = pcfg.get("min_pool_bnb", 0.4)

@@ -11,7 +11,7 @@ import time
 from typing import Optional
 
 from .base import BaseStrategy
-from strategy import Signal, WindowInfo
+from strategy import Signal, WindowInfo, compute_position_size
 
 logger = logging.getLogger(__name__)
 
@@ -92,16 +92,15 @@ class FollowCrowdStrategy(BaseStrategy):
             )
             return None
 
-        # Flat position sizing with guards
+        # Position sizing (% of bankroll with guards)
         pool_total_usdc = pool_total_bnb * prices[-1] if prices else 0.0
-        caps = [self.bankroll * self.max_bankroll_pct]
-        if pool_total_usdc > 0:
-            caps.append(pool_total_usdc * self.max_pool_pct)
-        pos_size = min(self.position_size_usdc, *caps)
-        if pos_size < self.min_position_usdc:
-            return None
-        pos_size = max(0.0, round(pos_size, 2))
-
+        pos_size = compute_position_size(
+            bankroll=self.bankroll,
+            bankroll_pct=self.bankroll_pct,
+            min_usdc=self.min_position_usdc,
+            max_pool_pct=self.max_pool_pct,
+            pool_total_usdc=pool_total_usdc,
+        )
         if pos_size <= 0:
             return None
 

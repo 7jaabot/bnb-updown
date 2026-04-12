@@ -224,16 +224,10 @@ class RSIReversalStrategy(BaseStrategy):
 
         # ── Position sizing (Kelly) ────────────────────────────────────────────
         pool_total_usdc = pool_total_bnb * prices[-1] if prices else 0.0
-        raw_k, pos_size = compute_position_size(
-            edge=edge,
-            p_up=p_up,
-            side=side,
-            yes_price=self.FAIR_ODDS_PRICE,
+        pos_size = compute_position_size(
             bankroll=self.bankroll,
-            position_size_usdc=self.position_size_usdc,
-        
+            bankroll_pct=self.bankroll_pct,
             min_usdc=self.min_position_usdc,
-            max_bankroll_pct=self.max_bankroll_pct,
             max_pool_pct=self.max_pool_pct,
             pool_total_usdc=pool_total_usdc,
         )
