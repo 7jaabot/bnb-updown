@@ -953,7 +953,7 @@ class PolymarketBot:
                             entry_price=entry_price,
                             position_size_usdc=signal.position_size_usdc,
                             bet_bnb=bet_bnb,
-                            bnb_price_at_entry=bnb_price,
+                            bnb_price_at_entry=self.binance.last_price or 600.0,
                             p_up_at_entry=signal.p_up,
                             yes_price_at_entry=signal.yes_price,
                             edge_at_entry=signal.edge,
