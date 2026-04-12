@@ -779,35 +779,38 @@ class PolymarketBot:
 
             # For live mode: compute dynamic position size + pre-build and pre-sign both TXs
             if self.mode == "live" and hasattr(self.trader, 'prepare_transactions'):
-                bnb_price = self.binance.last_price or 600.0
-                # Dynamic sizing: 5% of wallet, min $10, capped by pool later
-                wallet_bnb = self.trader.get_bnb_balance()
-                wallet_usdc = wallet_bnb * bnb_price
-                self.trader.metrics.bankroll = wallet_usdc
-                bet_usdc = max(
-                    self.config.get("strategy", {}).get("min_position_usdc", 10.0),
-                    wallet_usdc * 0.05,
-                )
-                # Update all strategies' position_size_usdc so evaluate() uses it
-                for s in self._strategies:
-                    s.position_size_usdc = bet_usdc
-                bet_bnb = bet_usdc / bnb_price
-                self.logger.info(
-                    f"💰 Live sizing: wallet={wallet_usdc:.2f} USDC | "
-                    f"5%={wallet_usdc*0.05:.2f} | bet={bet_usdc:.2f} USDC ({bet_bnb:.6f} BNB)"
-                )
-                try:
-                    ok = await loop.run_in_executor(
-                        None,
-                        lambda: self.trader.prepare_transactions(current_epoch, bet_bnb)
+                bnb_price = self.binance.last_price
+                if not bnb_price:
+                    self.logger.warning("No BNB price from Binance WS — skipping TX pre-sign")
+                else:
+                    # Dynamic sizing: 5% of wallet, min $10, capped by pool later
+                    wallet_bnb = self.trader.get_bnb_balance()
+                    wallet_usdc = wallet_bnb * bnb_price
+                    self.trader.metrics.bankroll = wallet_usdc
+                    bet_usdc = max(
+                        self.config.get("strategy", {}).get("min_position_usdc", 10.0),
+                        wallet_usdc * 0.05,
                     )
-                    if ok:
-                        self.logger.info(
-                            f"✅ Both TXs pre-signed for epoch {current_epoch} | "
-                            f"bet={bet_bnb:.6f} BNB"
+                    # Update all strategies' position_size_usdc so evaluate() uses it
+                    for s in self._strategies:
+                        s.position_size_usdc = bet_usdc
+                    bet_bnb = bet_usdc / bnb_price
+                    self.logger.info(
+                        f"💰 Live sizing: wallet={wallet_usdc:.2f} USDC | "
+                        f"5%={wallet_usdc*0.05:.2f} | bet={bet_usdc:.2f} USDC ({bet_bnb:.6f} BNB)"
+                    )
+                    try:
+                        ok = await loop.run_in_executor(
+                            None,
+                            lambda: self.trader.prepare_transactions(current_epoch, bet_bnb)
                         )
-                except Exception as e:
-                    self.logger.warning(f"TX pre-signing failed (non-fatal): {e}")
+                        if ok:
+                            self.logger.info(
+                                f"✅ Both TXs pre-signed for epoch {current_epoch} | "
+                                f"bet={bet_bnb:.6f} BNB"
+                            )
+                    except Exception as e:
+                        self.logger.warning(f"TX pre-signing failed (non-fatal): {e}")
 
             self._prefetch_done = True
             self.dashboard.update_status("📡 Data pre-loaded — awaiting sniper window")
@@ -953,7 +956,7 @@ class PolymarketBot:
                             entry_price=entry_price,
                             position_size_usdc=signal.position_size_usdc,
                             bet_bnb=bet_bnb,
-                            bnb_price_at_entry=self.binance.last_price or 600.0,
+                            bnb_price_at_entry=self.binance.last_price or 0.0,
                             p_up_at_entry=signal.p_up,
                             yes_price_at_entry=signal.yes_price,
                             edge_at_entry=signal.edge,
